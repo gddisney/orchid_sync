@@ -1,5 +1,4 @@
-module orchid_sync
-
+module github.com/gddisney/orchid_sync
 go 1.25.10
 
 require (
