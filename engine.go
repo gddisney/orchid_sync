@@ -8,44 +8,48 @@ import (
 
 	"github.com/gddisney/secure_network"
 	"github.com/gddisney/ultimate_db"
+	"github.com/gddisney/webauthnext"
 )
 
 // Engine is the top-level wrapper managing local storage and cluster state.
 type Engine struct {
 	db       *ultimate_db.DB
-	netNode  *secure_network.EdgeNode 
+	netNode  *secure_network.EdgeNode
 	analyzer *Analyzer
 	scorer   *BM25Scorer
 	mu       sync.RWMutex
-
 	// Global cluster metrics needed for BM25
-	TotalDocs int
-	AvgDocLen float64
+	TotalDocs  int
+	AvgDocLen  float64
 }
 
 // NewEngine bootstraps the Consummate search wrapper.
-func NewEngine(dbPath string, networkPort int) (*Engine, error) {
-	// 1. Generate an ephemeral static private key for the edge node (Replace with TPM later)
+func NewEngine(dbPath string, networkPort int, auth *webauthnext.Provider) (*Engine, error) {
+	// 1. Generate an ephemeral static private key for the edge node
 	privKey := make([]byte, 32)
 	_, err := rand.Read(privKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate node key: %w", err)
 	}
 
-	// 2. Initialize the Edge Network
-	// Notice that NewEdgeNode automatically boots ultimate_db internally using dbPath.
-	// We pass nil for the webauthnext Provider for now since we are just bootstrapping.
-	node, err := secure_network.NewEdgeNode(context.Background(), dbPath, privKey, nil)
+	// 2. Initialize the Edge Network with the OIDC Provider
+	// We pass the auth provider so the node can verify cryptographic identities
+	node, err := secure_network.NewEdgeNode(context.Background(), dbPath, privKey, auth)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize secure network EdgeNode: %w", err)
+		return nil, fmt.Errorf("failed to initialize secure network EdgeNode: %v", err)
 	}
 
 	return &Engine{
-		db:       node.DB, // Grab the active DB pointer natively from the EdgeNode
+		db:       node.DB,
 		netNode:  node,
 		analyzer: NewAnalyzer(),
 		scorer:   NewBM25Scorer(),
 	}, nil
+}
+
+// NetNode exposes the underlying EdgeNode for UI binding
+func (e *Engine) NetNode() *secure_network.EdgeNode {
+	return e.netNode
 }
 
 // Index intercepts a document, analyzes it, and preps it for the B+ Tree.
@@ -59,7 +63,7 @@ func (e *Engine) Index(docID string, text string) error {
 	// 2. Calculate Term Frequency (TF) for this specific document
 	// 3. Update global Document Frequency (DF) counts
 	// 4. Write optimized tokens down to ultimate_db via an MVCC transaction
-	_ = tokens // Suppress unused variable error during scaffolding
-
+	_ = tokens 
+	
 	return nil
 }
