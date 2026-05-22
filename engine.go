@@ -52,18 +52,25 @@ func (e *Engine) NetNode() *secure_network.EdgeNode {
 	return e.netNode
 }
 
+
 // Index intercepts a document, analyzes it, and preps it for the B+ Tree.
 func (e *Engine) Index(docID string, text string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// 1. Run text through the NLP pipeline
-	tokens := e.analyzer.Tokenize(text)
+	// ✨ FIX: Bridge the Engine's Indexer block directly into your index.go pipeline
+	indexer := NewIndexer(e.db, e.analyzer)
+	err := indexer.AddDocument(docID, text)
+	if err != nil {
+		return err
+	}
 
-	// 2. Calculate Term Frequency (TF) for this specific document
-	// 3. Update global Document Frequency (DF) counts
-	// 4. Write optimized tokens down to ultimate_db via an MVCC transaction
-	_ = tokens 
-	
+	// Dynamic calculation updates to maintain global BM25 scoring parameters
+	tokens := e.analyzer.Tokenize(text)
+	if len(tokens) > 0 {
+		e.TotalDocs++
+		e.AvgDocLen = ((e.AvgDocLen * float64(e.TotalDocs-1)) + float64(len(tokens))) / float64(e.TotalDocs)
+	}
+
 	return nil
 }
