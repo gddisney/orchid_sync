@@ -54,7 +54,7 @@ func (idx *Indexer) AddDocument(docID string, text string) error {
 		// 4. Construct Compound Key: term:<word>:<docID>
 		// This completely bypasses the need to read, unmarshal, append, and re-marshal 
 		// massive JSON arrays when highly frequent words are indexed.
-		termKey := []byte(fmt.Sprintf("term:%s:%s", term, docID))
+		termKey := []byte(fmt.Sprintf("term:%s", term))
 		
 		posting := Posting{
 			DocID: docID,
