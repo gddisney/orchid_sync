@@ -8,19 +8,22 @@ import (
 	"github.com/gddisney/logger"
 	"github.com/gddisney/secure_network"
 	"github.com/gddisney/ultimate_db"
+	"github.com/gddisney/webauthnext"
 )
 
 // MetadataPageID is strictly reserved for global engine state
 // (BM25 metrics, cluster info, etc.)
 const MetadataPageID ultimate_db.PageID = 11
 
-// EngineState holds the global metrics required to accurately calculate BM25 scores
+// EngineState holds the global metrics required
+// to accurately calculate BM25 scores.
 type EngineState struct {
 	TotalDocs int     `json:"total_docs"`
 	AvgDocLen float64 `json:"avg_doc_len"`
 }
 
-// Engine is the top-level wrapper managing local storage and cluster state.
+// Engine is the top-level wrapper managing
+// local storage and cluster state.
 type Engine struct {
 	db       *ultimate_db.DB
 	netNode  *secure_network.EdgeNode
@@ -30,14 +33,18 @@ type Engine struct {
 
 	mu sync.RWMutex
 
-	// Global cluster metrics needed for BM25
+	// Global cluster metrics needed for BM25.
 	TotalDocs int
 	AvgDocLen float64
 }
 
-// NewEngine bootstraps the search wrapper using persistent identities and state.
-// By accepting the pre-configured EdgeNode, we ensure the search engine uses the
-// exact same cryptographic identity as the rest of the Zero-Trust mesh.
+// NewEngine bootstraps the search wrapper using
+// persistent identities and state.
+//
+// By accepting the pre-configured EdgeNode,
+// we ensure the search engine uses the exact
+// same cryptographic identity as the rest
+// of the Zero-Trust mesh.
 func NewEngine(
 	db *ultimate_db.DB,
 	node *secure_network.EdgeNode,
@@ -52,8 +59,9 @@ func NewEngine(
 		logger:   sysLog,
 	}
 
-	// Recover persistent BM25 state to prevent
-	// relevance degradation on restart.
+	// Recover persistent BM25 state
+	// to prevent relevance degradation
+	// on restart.
 	txn := db.BeginTxn()
 
 	stateBytes, err := db.Read(
@@ -68,14 +76,18 @@ func NewEngine(
 
 		var state EngineState
 
-		if err := json.Unmarshal(stateBytes, &state); err == nil {
+		if err := json.Unmarshal(
+			stateBytes,
+			&state,
+		); err == nil {
 
 			eng.TotalDocs = state.TotalDocs
 			eng.AvgDocLen = state.AvgDocLen
 
 			if eng.logger != nil {
+
 				eng.logger.Info(
-					"Recovered BM25 engine state from persistent storage",
+					"Recovered BM25 engine state from storage",
 				)
 			}
 		}
@@ -98,7 +110,7 @@ func NewEngineWithNode(
 	db *ultimate_db.DB,
 	gatewayAddr string,
 	signerKey []byte,
-	provider interface{},
+	provider *webauthnext.Provider,
 	sysLog *logger.LogDispatcher,
 ) (*Engine, error) {
 
@@ -126,8 +138,8 @@ func NewEngineWithNode(
 	)
 }
 
-// NetNode exposes the underlying EdgeNode for UI binding
-// or external cluster health checks.
+// NetNode exposes the underlying EdgeNode
+// for UI binding or external cluster checks.
 func (e *Engine) NetNode() *secure_network.EdgeNode {
 	return e.netNode
 }
@@ -139,13 +151,17 @@ func (e *Engine) Index(
 	text string,
 ) error {
 
-	// 1. Write the document to the inverted index.
+	// Write the document into the inverted index.
 	indexer := NewIndexer(
 		e.db,
 		e.analyzer,
 	)
 
-	err := indexer.AddDocument(docID, text)
+	err := indexer.AddDocument(
+		docID,
+		text,
+	)
+
 	if err != nil {
 
 		if e.logger != nil {
@@ -158,7 +174,7 @@ func (e *Engine) Index(
 		return err
 	}
 
-	// 2. Tokenize to calculate document length.
+	// Tokenize for BM25 statistics.
 	tokens := e.analyzer.Tokenize(text)
 
 	if len(tokens) > 0 {
@@ -166,17 +182,17 @@ func (e *Engine) Index(
 		e.mu.Lock()
 		defer e.mu.Unlock()
 
-		previousDocs := e.TotalDocs
+		prevDocs := e.TotalDocs
 
-		// 3. Update Global BM25 Parameters.
+		// Update BM25 metrics.
 		e.TotalDocs++
 
 		e.AvgDocLen =
-			((e.AvgDocLen * float64(previousDocs)) +
+			((e.AvgDocLen * float64(prevDocs)) +
 				float64(len(tokens))) /
 				float64(e.TotalDocs)
 
-		// 4. Persist updated BM25 state.
+		// Persist updated BM25 state.
 		state := EngineState{
 			TotalDocs: e.TotalDocs,
 			AvgDocLen: e.AvgDocLen,
