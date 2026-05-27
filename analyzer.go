@@ -6,6 +6,7 @@ import (
 )
 
 // Analyzer processes raw text into indexable tokens.
+// It is completely stateless and safe for concurrent use across multiple indexing goroutines.
 type Analyzer struct {
 	stopWords map[string]bool
 }
@@ -15,6 +16,7 @@ func NewAnalyzer() *Analyzer {
 		stopWords: map[string]bool{
 			"the": true, "is": true, "at": true, "which": true, "on": true,
 			"and": true, "a": true, "an": true, "in": true, "of": true,
+			"to": true, "for": true, "with": true, "by": true, "as": true,
 		},
 	}
 }
@@ -27,7 +29,10 @@ func (a *Analyzer) Tokenize(text string) []string {
 	}
 	rawTokens := strings.FieldsFunc(text, f)
 	
-	var tokens []string
+	// Performance Optimization: Pre-allocate the slice capacity to prevent 
+	// expensive array re-allocations and memory copying during the append loop.
+	tokens := make([]string, 0, len(rawTokens))
+	
 	for _, t := range rawTokens {
 		clean := strings.ToLower(t)
 		// Filter out stop words and single-character garbage
@@ -35,5 +40,6 @@ func (a *Analyzer) Tokenize(text string) []string {
 			tokens = append(tokens, clean)
 		}
 	}
+	
 	return tokens
 }
