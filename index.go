@@ -7,7 +7,7 @@ import (
 	"github.com/gddisney/ultimate_db"
 )
 
-// We dedicate a specific B+ Tree page ID strictly for the search index to avoid collisions
+// IndexPageID is strictly reserved for inverted index postings to avoid collisions
 const IndexPageID ultimate_db.PageID = 10 
 
 // Posting represents a single document's relationship to a specific term.
@@ -23,6 +23,7 @@ type Indexer struct {
 	analyzer *Analyzer
 }
 
+// NewIndexer initializes the pipeline worker
 func NewIndexer(db *ultimate_db.DB, analyzer *Analyzer) *Indexer {
 	return &Indexer{
 		db:       db,
@@ -31,7 +32,7 @@ func NewIndexer(db *ultimate_db.DB, analyzer *Analyzer) *Indexer {
 }
 
 // AddDocument tokenizes raw text, calculates term frequencies, and safely updates 
-// the inverted index posting lists inside the database.
+// the inverted index using O(1) compound key writes to prevent write amplification.
 func (idx *Indexer) AddDocument(docID string, text string) error {
 	// 1. Run text through the NLP pipeline
 	tokens := idx.analyzer.Tokenize(text)
@@ -50,29 +51,22 @@ func (idx *Indexer) AddDocument(docID string, text string) error {
 	defer idx.db.CommitTxn(txn)
 
 	for term, count := range termCounts {
-		termKey := append([]byte("term:"), []byte(term)...)
+		// 4. Construct Compound Key: term:<word>:<docID>
+		// This completely bypasses the need to read, unmarshal, append, and re-marshal 
+		// massive JSON arrays when highly frequent words are indexed.
+		termKey := []byte(fmt.Sprintf("term:%s:%s", term, docID))
 		
-		// 4. Fetch the existing postings list for this word
-		var postings []Posting
-		existingData, err := idx.db.Read(IndexPageID, txn, termKey)
-		
-		if err == nil && len(existingData) > 0 {
-			// If the term already exists, unmarshal the current list of documents
-			if err := json.Unmarshal(existingData, &postings); err != nil {
-				return fmt.Errorf("index corruption on term %s: %w", term, err)
-			}
-		}
-
-		// 5. Append this new document's metrics to the term's posting list
-		postings = append(postings, Posting{
+		posting := Posting{
 			DocID: docID,
 			TF:    float64(count), 
-		})
+		}
 
-		// 6. Serialize and save back to the B+ Tree
-		// Note: We use standard Write here, but for production, WriteCompressed 
-		// would drastically reduce the footprint of massive posting lists.
-		updatedData, _ := json.Marshal(postings)
+		// 5. Serialize and save the discrete posting to the B+ Tree
+		updatedData, err := json.Marshal(posting)
+		if err != nil {
+			return fmt.Errorf("failed to marshal posting for term %s: %w", term, err)
+		}
+
 		if err := idx.db.Write(IndexPageID, txn, termKey, updatedData, 0); err != nil {
 			return fmt.Errorf("failed to write posting for term %s: %w", term, err)
 		}
