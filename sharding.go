@@ -1,70 +1,340 @@
 package orchid_sync
 
 import (
+	"container/heap"
 	"context"
 	"encoding/json"
+	"errors"
 	"sort"
+	"sync"
 	"time"
 )
 
-// ClusterQuery represents the JSON payload sent across the secure_network Noise tunnels.
+const (
+	DefaultSearchTimeout = 5 * time.Second
+	MaxFanoutPeers       = 8
+)
+
 type ClusterQuery struct {
-	QueryID   string `json:"query_id"`
-	QueryText string `json:"query_text"`
-	Limit     int    `json:"limit"`
+	QueryID     string    `json:"query_id"`
+	QueryText   string    `json:"query_text"`
+	Limit       int       `json:"limit"`
+	OriginNode  string    `json:"origin_node"`
+	ShardIDs    []uint64  `json:"shard_ids"`
+	RequestedAt time.Time `json:"requested_at"`
 }
 
-// ScatterGather is the entry point for a distributed OrchidSync search.
-// It queries the local node, broadcasts to the secure_network mesh,
-// and merges the BM25 scored results from the cluster.
-func (e *Engine) ScatterGather(ctx context.Context, query string, limit int) ([]SearchResult, error) {
-	// 1. Execute the local search using the BM25 logic (from search.go)
-	localResults, err := e.Search(query, limit)
+type ClusterResponse struct {
+	QueryID   string         `json:"query_id"`
+	NodeID    string         `json:"node_id"`
+	Results   []SearchResult `json:"results"`
+	Duration  int64          `json:"duration_ms"`
+	Partial   bool           `json:"partial"`
+	ShardID   uint64         `json:"shard_id"`
+	ErrorText string         `json:"error,omitempty"`
+}
+
+type PendingQuery struct {
+	QueryID  string
+	Expected int
+	Received int
+
+	Results []SearchResult
+
+	ResponseCh chan ClusterResponse
+	Done       chan struct{}
+
+	CreatedAt time.Time
+}
+
+type SearchCoordinator struct {
+	mu      sync.Mutex
+	pending map[string]*PendingQuery
+}
+
+func NewSearchCoordinator() *SearchCoordinator {
+	return &SearchCoordinator{
+		pending: make(map[string]*PendingQuery),
+	}
+}
+
+func (sc *SearchCoordinator) Register(
+	queryID string,
+	expected int,
+) *PendingQuery {
+
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	pq := &PendingQuery{
+		QueryID:    queryID,
+		Expected:   expected,
+		ResponseCh: make(chan ClusterResponse, expected),
+		Done:       make(chan struct{}),
+		CreatedAt:  time.Now(),
+	}
+
+	sc.pending[queryID] = pq
+
+	return pq
+}
+
+func (sc *SearchCoordinator) Resolve(
+	resp ClusterResponse,
+) {
+
+	sc.mu.Lock()
+
+	pq, exists := sc.pending[resp.QueryID]
+
+	sc.mu.Unlock()
+
+	if !exists {
+		return
+	}
+
+	select {
+	case pq.ResponseCh <- resp:
+	default:
+	}
+}
+
+func (sc *SearchCoordinator) Cleanup(
+	queryID string,
+) {
+
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	delete(sc.pending, queryID)
+}
+
+func (e *Engine) ScatterGather(
+	ctx context.Context,
+	query string,
+	limit int,
+) ([]SearchResult, error) {
+
+	if limit <= 0 {
+		limit = 10
+	}
+
+	queryID := generateQueryID()
+
+	// Local shard search first.
+	localResults, err := e.Search(
+		query,
+		limit,
+	)
+
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Prepare for network fan-out (Scatter Phase)
-	// We wrap the search query into a struct and broadcast it to the peer mesh.
-	queryPayload, _ := json.Marshal(ClusterQuery{
-		QueryID:   generateQueryID(), // Replace with a UUID generator
-		QueryText: query,
-		Limit:     limit,
-	})
+	// Determine responsible shards.
+	shards := e.DetermineRelevantShards(
+		query,
+	)
 
-	// Broadcast the query intent to the QUIC mesh network.
-	// Other nodes will receive this via their IngressHandler, run e.Search() locally, 
-	// and return their hits.
-	if e.netNode != nil && e.netNode.PeerMesh != nil {
-		e.netNode.PeerMesh.Broadcast(ctx, queryPayload)
+	// Route only to owning peers.
+	targetPeers := e.FindResponsiblePeers(
+		shards,
+		MaxFanoutPeers,
+	)
+
+	pending := e.coordinator.Register(
+		queryID,
+		len(targetPeers),
+	)
+
+	defer e.coordinator.Cleanup(
+		queryID,
+	)
+
+	clusterQuery := ClusterQuery{
+		QueryID:     queryID,
+		QueryText:   query,
+		Limit:       limit,
+		OriginNode:  e.NodeID(),
+		ShardIDs:    shards,
+		RequestedAt: time.Now(),
 	}
 
-	// 3. Gather Phase (Simulated for the orchestration layer)
-	// In a complete implementation, you would wait on a Go channel here 
-	// for the remote nodes to reply with their SearchResult payloads.
-	var globalResults []SearchResult
-	globalResults = append(globalResults, localResults...)
+	payload, err := json.Marshal(
+		clusterQuery,
+	)
 
-	// Mocking incoming remote results for demonstration
-	// remoteResults := waitForPeerResponses(ctx, queryID)
-	// globalResults = append(globalResults, remoteResults...)
-
-	// 4. Merge and re-rank the global results
-	// For MVP distributed BM25, we trust the local scores calculated by peers and sort.
-	// (For strict BM25 accuracy, nodes would first need to sync global Document Frequencies).
-	sort.Slice(globalResults, func(i, j int) bool {
-		return globalResults[i].Score > globalResults[j].Score
-	})
-
-	// 5. Apply the final Top-K limit across the merged cluster results
-	if limit > 0 && len(globalResults) > limit {
-		globalResults = globalResults[:limit]
+	if err != nil {
+		return nil, err
 	}
 
-	return globalResults, nil
+	for _, peer := range targetPeers {
+
+		go e.dispatchQuery(
+			ctx,
+			peer,
+			payload,
+		)
+	}
+
+	merged := NewTopKHeap(limit)
+
+	for _, r := range localResults {
+		heap.Push(merged, r)
+	}
+
+	timeout := time.NewTimer(
+		DefaultSearchTimeout,
+	)
+
+	defer timeout.Stop()
+
+	for {
+
+		if pending.Received >= pending.Expected {
+			break
+		}
+
+		select {
+
+		case <-ctx.Done():
+			return merged.Results(), ctx.Err()
+
+		case <-timeout.C:
+			return merged.Results(), nil
+
+		case resp := <-pending.ResponseCh:
+
+			pending.Received++
+
+			if resp.ErrorText != "" {
+				continue
+			}
+
+			for _, r := range resp.Results {
+				heap.Push(merged, r)
+			}
+		}
+	}
+
+	return merged.Results(), nil
 }
 
-// generateQueryID is a placeholder for generating unique distributed tracing IDs
+func (e *Engine) dispatchQuery(
+	ctx context.Context,
+	peer RoutingEntry,
+	payload []byte,
+) {
+
+	_ = e.netNode.PeerMesh.SendToPeer(
+		ctx,
+		peer.ID,
+		payload,
+	)
+}
+
+func (e *Engine) HandleClusterQuery(
+	ctx context.Context,
+	query ClusterQuery,
+) ClusterResponse {
+
+	start := time.Now()
+
+	results, err := e.Search(
+		query.QueryText,
+		query.Limit,
+	)
+
+	if err != nil {
+
+		return ClusterResponse{
+			QueryID:  query.QueryID,
+			NodeID:   e.NodeID(),
+			Partial:  true,
+			Duration: time.Since(start).Milliseconds(),
+			ErrorText: err.Error(),
+		}
+	}
+
+	return ClusterResponse{
+		QueryID:  query.QueryID,
+		NodeID:   e.NodeID(),
+		Results:  results,
+		Duration: time.Since(start).Milliseconds(),
+	}
+}
+
+type TopKHeap struct {
+	limit int
+	items []SearchResult
+}
+
+func NewTopKHeap(limit int) *TopKHeap {
+	h := &TopKHeap{
+		limit: limit,
+	}
+	heap.Init(h)
+	return h
+}
+
+func (h TopKHeap) Len() int {
+	return len(h.items)
+}
+
+func (h TopKHeap) Less(i, j int) bool {
+	return h.items[i].Score <
+		h.items[j].Score
+}
+
+func (h TopKHeap) Swap(i, j int) {
+	h.items[i], h.items[j] =
+		h.items[j], h.items[i]
+}
+
+func (h *TopKHeap) Push(x interface{}) {
+
+	item := x.(SearchResult)
+
+	if len(h.items) < h.limit {
+		h.items = append(h.items, item)
+		return
+	}
+
+	if item.Score <= h.items[0].Score {
+		return
+	}
+
+	h.items[0] = item
+	heap.Fix(h, 0)
+}
+
+func (h *TopKHeap) Pop() interface{} {
+
+	old := h.items
+	n := len(old)
+
+	item := old[n-1]
+
+	h.items = old[:n-1]
+
+	return item
+}
+
+func (h *TopKHeap) Results() []SearchResult {
+
+	results := make([]SearchResult, len(h.items))
+	copy(results, h.items)
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score >
+			results[j].Score
+	})
+
+	return results
+}
+
 func generateQueryID() string {
-	return "q_" + time.Now().Format("20060102150405")
+	return time.Now().
+		UTC().
+		Format("20060102150405.000000000")
 }
