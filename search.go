@@ -161,9 +161,7 @@ func (r *ConsistentHashRing) GetOwner(
 		idx = 0
 	}
 
-	owner := r.ring[
-		r.sortedHashes[idx]
-	]
+	owner := r.ring[r.sortedHashes[idx]]
 
 	return owner, nil
 }
