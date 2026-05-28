@@ -1,12 +1,12 @@
 package orchid_sync
 
 import (
-	"context"
 	"encoding/json"
 	"sync"
 
 	"github.com/gddisney/logger"
 	"github.com/gddisney/secure_network"
+	"github.com/gddisney/service_keys"
 	"github.com/gddisney/ultimate_db"
 )
 
@@ -22,7 +22,7 @@ type EngineState struct {
 // Engine is the top-level wrapper managing local storage and cluster state.
 type Engine struct {
 	db       *ultimate_db.DB
-	netNode  *secure_network.MeshNode // FIX: Updated to MeshNode
+	netNode  *secure_network.MeshNode
 	analyzer *Analyzer
 	scorer   *BM25Scorer
 	sharding *ConsistentHashRing 
@@ -37,7 +37,7 @@ type Engine struct {
 // NewEngine bootstraps the search wrapper.
 func NewEngine(
 	db *ultimate_db.DB,
-	node *secure_network.MeshNode, // FIX: Updated to MeshNode
+	node *secure_network.MeshNode,
 	sysLog *logger.LogDispatcher,
 ) (*Engine, error) {
 
@@ -74,21 +74,17 @@ func NewEngine(
 // NewEngineWithNode creates a secure mesh node internally.
 func NewEngineWithNode(
 	db *ultimate_db.DB,
-	sysLog *logger.LogDispatcher,
-	arg1 string, // Gateway Address
-	arg2 string, // Node ID / Host
-	arg3 string, // Port / Protocol
 	signerKey []byte,
+	km *service_keys.ServiceKeyManager,
+	sysLog *logger.LogDispatcher,
 ) (*Engine, error) {
 
-	// FIX: Updated to NewMeshNode
+	// Passes the exact sequence the compiler demanded
 	node, err := secure_network.NewMeshNode(
 		db,
-		sysLog,
-		arg1,
-		arg2,
-		arg3,
 		signerKey,
+		km,
+		sysLog,
 	)
 
 	if err != nil {
@@ -102,7 +98,7 @@ func NewEngineWithNode(
 }
 
 // NetNode exposes the underlying node.
-func (e *Engine) NetNode() *secure_network.MeshNode { // FIX: Updated to MeshNode
+func (e *Engine) NetNode() *secure_network.MeshNode {
 	return e.netNode
 }
 
