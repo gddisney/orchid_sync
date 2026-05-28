@@ -302,9 +302,7 @@ func (e *Engine) FindResponsiblePeers(
 			continue
 		}
 
-		peer, ok := e.sharding.peers[
-			shard.Owner
-		]
+		peer, ok := e.sharding.peers[shard.Owner]
 
 		if !ok {
 			continue
