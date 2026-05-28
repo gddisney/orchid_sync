@@ -25,7 +25,6 @@ type Engine struct {
 	netNode  *secure_network.MeshNode
 	analyzer *Analyzer
 	scorer   *BM25Scorer
-	sharding *ConsistentHashRing 
 	logger   *logger.LogDispatcher
 
 	mu sync.RWMutex
@@ -79,13 +78,8 @@ func NewEngineWithNode(
 	sysLog *logger.LogDispatcher,
 ) (*Engine, error) {
 
-	// Passes the exact sequence the compiler demanded
-	node, err := secure_network.NewMeshNode(
-		db,
-		signerKey,
-		km,
-		sysLog,
-	)
+	// Fixed: Updated to match correct signature (db, signerKey)
+	node, err := secure_network.NewMeshNode(db, signerKey)
 
 	if err != nil {
 		if sysLog != nil {
