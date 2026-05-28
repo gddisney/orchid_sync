@@ -1,28 +1,63 @@
 package orchid_sync
 
 import (
-	"encoding/json"
+	"container/heap"
+	"encoding/binary"
+	"errors"
+	"math"
 	"sort"
-	"strings"
 
 	"github.com/gddisney/ultimate_db"
 )
 
 const (
-	IndexPageID = 10
-	MetaPageID  = 11
+	IndexPageID ultimate_db.PageID = 10
+	MetaPageID  ultimate_db.PageID = 11
 )
 
-// SearchResult represents a ranked document hit.
 type SearchResult struct {
-	DocID     string  `json:"doc_id"`
-	Score     float64 `json:"score"`
-	ShardID   string  `json:"shard_id,omitempty"`
-	NodeID    string  `json:"node_id,omitempty"`
-	DocLength int     `json:"doc_length,omitempty"`
+	DocID string  `json:"doc_id"`
+	Score float64 `json:"score"`
 }
 
-// extractTerms walks the query AST and extracts searchable terms.
+type Posting struct {
+	DocID string
+	TF    float64
+}
+
+type DocMeta struct {
+	Length uint32 `json:"length"`
+}
+
+type scoredDoc struct {
+	docID string
+	score float64
+}
+
+type resultHeap []scoredDoc
+
+func (h resultHeap) Len() int { return len(h) }
+
+func (h resultHeap) Less(i, j int) bool {
+	return h[i].score < h[j].score
+}
+
+func (h resultHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+}
+
+func (h *resultHeap) Push(x interface{}) {
+	*h = append(*h, x.(scoredDoc))
+}
+
+func (h *resultHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
+}
+
 func extractTerms(q ultimate_db.Query) []string {
 	switch v := q.(type) {
 
@@ -30,237 +65,185 @@ func extractTerms(q ultimate_db.Query) []string {
 		if v.Term == "" {
 			return nil
 		}
-
-		return []string{
-			strings.ToLower(strings.TrimSpace(v.Term)),
-		}
+		return []string{v.Term}
 
 	case *ultimate_db.AndQuery:
-		return append(
-			extractTerms(v.Left),
-			extractTerms(v.Right)...,
-		)
+		left := extractTerms(v.Left)
+		right := extractTerms(v.Right)
+		return append(left, right...)
 
 	case *ultimate_db.OrQuery:
-		return append(
-			extractTerms(v.Left),
-			extractTerms(v.Right)...,
-		)
+		left := extractTerms(v.Left)
+		right := extractTerms(v.Right)
+		return append(left, right...)
 
 	case *ultimate_db.NotQuery:
-		return extractTerms(v.Right)
+		return extractTerms(v.Left)
 	}
 
 	return nil
 }
 
-// getAllDocs retrieves all indexed document IDs.
-func (e *Engine) getAllDocs(txn uint64) map[string]bool {
-	results := make(map[string]bool)
+func uniqueTerms(terms []string) []string {
+	seen := make(map[string]struct{})
+	var result []string
 
-	prefix := []byte("doc:")
-
-	_ = e.db.Scan(IndexPageID, txn, prefix,
-		func(key, value []byte) bool {
-			docID := strings.TrimPrefix(string(key), "doc:")
-			results[docID] = true
-			return true
-		},
-	)
-
-	return results
-}
-
-// getValidDocs evaluates boolean AST against the inverted index.
-func (e *Engine) getValidDocs(q ultimate_db.Query, txn uint64) map[string]bool {
-
-	switch v := q.(type) {
-
-	case *ultimate_db.TermQuery:
-
-		results := make(map[string]bool)
-
-		term := strings.ToLower(strings.TrimSpace(v.Term))
-		if term == "" {
-			return results
+	for _, t := range terms {
+		if _, ok := seen[t]; ok {
+			continue
 		}
 
-		termKey := []byte("term:" + term)
-
-		postingsBytes, err := e.db.Read(
-			IndexPageID,
-			txn,
-			termKey,
-		)
-
-		if err != nil || len(postingsBytes) == 0 {
-			return results
-		}
-
-		var postings []Posting
-
-		if err := json.Unmarshal(postingsBytes, &postings); err != nil {
-			return results
-		}
-
-		for _, posting := range postings {
-			results[posting.DocID] = true
-		}
-
-		return results
-
-	case *ultimate_db.AndQuery:
-
-		left := e.getValidDocs(v.Left, txn)
-		right := e.getValidDocs(v.Right, txn)
-
-		results := make(map[string]bool)
-
-		for docID := range left {
-			if right[docID] {
-				results[docID] = true
-			}
-		}
-
-		return results
-
-	case *ultimate_db.OrQuery:
-
-		results := e.getValidDocs(v.Left, txn)
-
-		right := e.getValidDocs(v.Right, txn)
-
-		for docID := range right {
-			results[docID] = true
-		}
-
-		return results
-
-	case *ultimate_db.NotQuery:
-
-		allDocs := e.getAllDocs(txn)
-
-		excluded := e.getValidDocs(v.Right, txn)
-
-		for docID := range excluded {
-			delete(allDocs, docID)
-		}
-
-		return allDocs
+		seen[t] = struct{}{}
+		result = append(result, t)
 	}
 
-	return map[string]bool{}
+	return result
 }
 
-// getDocLength fetches stored document token count.
-func (e *Engine) getDocLength(
+func decodePosting(data []byte) (Posting, error) {
+	if len(data) < 10 {
+		return Posting{}, errors.New("invalid posting")
+	}
+
+	docLen := binary.BigEndian.Uint16(data[:2])
+
+	if len(data) < int(2+docLen+8) {
+		return Posting{}, errors.New("corrupt posting")
+	}
+
+	docID := string(data[2 : 2+docLen])
+
+	tfBits := binary.BigEndian.Uint64(data[2+docLen:])
+	tf := math.Float64frombits(tfBits)
+
+	return Posting{
+		DocID: docID,
+		TF:    tf,
+	}, nil
+}
+
+func encodePosting(p Posting) []byte {
+	docBytes := []byte(p.DocID)
+
+	buf := make([]byte, 2+len(docBytes)+8)
+
+	binary.BigEndian.PutUint16(buf[:2], uint16(len(docBytes)))
+
+	copy(buf[2:], docBytes)
+
+	binary.BigEndian.PutUint64(
+		buf[2+len(docBytes):],
+		math.Float64bits(p.TF),
+	)
+
+	return buf
+}
+
+func (e *Engine) getDocLength(txn uint64, docID string) float64 {
+	key := []byte("docmeta:" + docID)
+
+	val, err := e.db.Read(MetaPageID, txn, key)
+	if err != nil || len(val) < 4 {
+		return 1
+	}
+
+	length := binary.BigEndian.Uint32(val)
+
+	if length == 0 {
+		return 1
+	}
+
+	return float64(length)
+}
+
+func (e *Engine) collectCandidateDocs(
+	terms []string,
 	txn uint64,
-	docID string,
-) float64 {
+) map[string]bool {
 
-	key := []byte("meta:" + docID)
-
-	val, err := e.db.Read(
-		MetaPageID,
-		txn,
-		key,
-	)
-
-	if err != nil || len(val) == 0 {
-		return e.AvgDocLen
-	}
-
-	var meta struct {
-		Length int `json:"length"`
-	}
-
-	if err := json.Unmarshal(val, &meta); err != nil {
-		return e.AvgDocLen
-	}
-
-	if meta.Length <= 0 {
-		return e.AvgDocLen
-	}
-
-	return float64(meta.Length)
-}
-
-// Search executes distributed BM25 boolean search.
-func (e *Engine) Search(
-	query string,
-	limit int,
-) ([]SearchResult, error) {
-
-	e.mu.RLock()
-
-	totalDocs := e.TotalDocs
-	avgDocLen := e.AvgDocLen
-
-	e.mu.RUnlock()
-
-	ast, err := ultimate_db.ParseQuery(query)
-	if err != nil {
-		return nil, err
-	}
-
-	txn := e.db.BeginTxn()
-	defer e.db.CommitTxn(txn)
-
-	validDocs := e.getValidDocs(ast, txn)
-
-	if len(validDocs) == 0 {
-		return []SearchResult{}, nil
-	}
-
-	terms := extractTerms(ast)
-
-	uniqueTerms := make(map[string]struct{})
+	candidates := make(map[string]bool)
 
 	for _, term := range terms {
 
-		term = strings.ToLower(
-			strings.TrimSpace(term),
-		)
+		prefix := []byte("term:" + term + ":")
 
-		if term != "" {
-			uniqueTerms[term] = struct{}{}
-		}
+		_ = e.db.ScanCompressed(
+			IndexPageID,
+			txn,
+			prefix,
+			func(key, value []byte) bool {
+
+				posting, err := decodePosting(value)
+				if err != nil {
+					return true
+				}
+
+				candidates[posting.DocID] = true
+				return true
+			},
+		)
+	}
+
+	return candidates
+}
+
+func (e *Engine) scoreDocuments(
+	terms []string,
+	candidates map[string]bool,
+	txn uint64,
+	limit int,
+) []SearchResult {
+
+	e.mu.RLock()
+	totalDocs := e.TotalDocs
+	avgDocLen := e.AvgDocLen
+	e.mu.RUnlock()
+
+	if totalDocs <= 0 {
+		totalDocs = 1
+	}
+
+	if avgDocLen <= 0 {
+		avgDocLen = 1
 	}
 
 	docScores := make(map[string]float64)
 
-	for term := range uniqueTerms {
+	for _, term := range terms {
 
-		termKey := []byte("term:" + term)
-
-		postingsBytes, err := e.db.Read(
-			IndexPageID,
-			txn,
-			termKey,
-		)
-
-		if err != nil || len(postingsBytes) == 0 {
-			continue
-		}
+		prefix := []byte("term:" + term + ":")
 
 		var postings []Posting
 
-		if err := json.Unmarshal(postingsBytes, &postings); err != nil {
-			continue
-		}
+		_ = e.db.ScanCompressed(
+			IndexPageID,
+			txn,
+			prefix,
+			func(key, value []byte) bool {
+
+				posting, err := decodePosting(value)
+				if err != nil {
+					return true
+				}
+
+				postings = append(postings, posting)
+				return true
+			},
+		)
 
 		docFreq := len(postings)
 
+		if docFreq == 0 {
+			continue
+		}
+
 		for _, posting := range postings {
 
-			if !validDocs[posting.DocID] {
+			if !candidates[posting.DocID] {
 				continue
 			}
 
-			docLen := e.getDocLength(
-				txn,
-				posting.DocID,
-			)
+			docLen := e.getDocLength(txn, posting.DocID)
 
 			score := e.scorer.Score(
 				posting.TF,
@@ -274,35 +257,84 @@ func (e *Engine) Search(
 		}
 	}
 
-	results := make([]SearchResult, 0, len(docScores))
+	h := &resultHeap{}
+	heap.Init(h)
 
 	for docID, score := range docScores {
 
+		if h.Len() < limit {
+			heap.Push(h, scoredDoc{
+				docID: docID,
+				score: score,
+			})
+			continue
+		}
+
+		if (*h)[0].score < score {
+
+			heap.Pop(h)
+
+			heap.Push(h, scoredDoc{
+				docID: docID,
+				score: score,
+			})
+		}
+	}
+
+	var results []SearchResult
+
+	for h.Len() > 0 {
+
+		item := heap.Pop(h).(scoredDoc)
+
 		results = append(results, SearchResult{
-			DocID:     docID,
-			Score:     score,
-			DocLength: int(
-				e.getDocLength(txn, docID),
-			),
+			DocID: item.docID,
+			Score: item.score,
 		})
 	}
 
-	// Stable deterministic ordering
-	sort.SliceStable(results,
-		func(i, j int) bool {
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
 
-			if results[i].Score == results[j].Score {
-				return results[i].DocID < results[j].DocID
-			}
+	return results
+}
 
-			return results[i].Score >
-				results[j].Score
-		},
-	)
+func (e *Engine) Search(
+	query string,
+	limit int,
+) ([]SearchResult, error) {
 
-	if limit > 0 && len(results) > limit {
-		results = results[:limit]
+	if limit <= 0 {
+		limit = 10
 	}
+
+	ast, err := ultimate_db.ParseQuery(query)
+	if err != nil {
+		return nil, err
+	}
+
+	terms := uniqueTerms(extractTerms(ast))
+
+	if len(terms) == 0 {
+		return nil, nil
+	}
+
+	txn := e.db.BeginTxn()
+	defer e.db.CommitTxn(txn)
+
+	candidates := e.collectCandidateDocs(terms, txn)
+
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	results := e.scoreDocuments(
+		terms,
+		candidates,
+		txn,
+		limit,
+	)
 
 	return results, nil
 }
