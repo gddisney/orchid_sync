@@ -1,13 +1,11 @@
 package orchid_sync
 
-import "github.com/gddisney/ultimate_db"
-
 const (
 	DefaultVirtualNodes = 64
 	MaxShardReplicas    = 3
-	MetadataPageID      ultimate_db.PageID = 11
 )
 
+// RoutingEntry represents a peer that owns shards.
 type RoutingEntry struct {
 	ID       string
 	Address  string
@@ -16,14 +14,11 @@ type RoutingEntry struct {
 	Load     int64
 }
 
+// Shard represents a logical index partition.
 type Shard struct {
 	ID       uint64
 	Owner    string
 	Replicas []string
-	DocCount uint64
-}
 
-type EngineState struct {
-	TotalDocs   int    `json:"total_docs"`
-	TotalDocLen uint64 `json:"total_doc_len"`
+	DocCount uint64
 }
