@@ -1,6 +1,7 @@
 package orchid_sync
 
 import (
+	"context"
 	"encoding/json"
 	"sync"
 
@@ -21,7 +22,7 @@ type EngineState struct {
 // Engine is the top-level wrapper managing local storage and cluster state.
 type Engine struct {
 	db       *ultimate_db.DB
-	netNode  *secure_network.SecureNode // FIX: Restored to SecureNode to match your module
+	netNode  *secure_network.MeshNode // FIX: Updated to MeshNode
 	analyzer *Analyzer
 	scorer   *BM25Scorer
 	sharding *ConsistentHashRing 
@@ -36,7 +37,7 @@ type Engine struct {
 // NewEngine bootstraps the search wrapper.
 func NewEngine(
 	db *ultimate_db.DB,
-	node *secure_network.SecureNode, // FIX: Restored to SecureNode
+	node *secure_network.MeshNode, // FIX: Updated to MeshNode
 	sysLog *logger.LogDispatcher,
 ) (*Engine, error) {
 
@@ -71,17 +72,17 @@ func NewEngine(
 }
 
 // NewEngineWithNode creates a secure mesh node internally.
-// NewEngineWithNode creates a secure mesh node internally.
 func NewEngineWithNode(
 	db *ultimate_db.DB,
 	sysLog *logger.LogDispatcher,
-	arg1 string, // Likely Gateway Address
-	arg2 string, // Likely Node ID or Host
-	arg3 string, // Likely Port or Protocol
+	arg1 string, // Gateway Address
+	arg2 string, // Node ID / Host
+	arg3 string, // Port / Protocol
 	signerKey []byte,
 ) (*Engine, error) {
 
-	node, err := secure_network.NewSecureNode(
+	// FIX: Updated to NewMeshNode
+	node, err := secure_network.NewMeshNode(
 		db,
 		sysLog,
 		arg1,
@@ -101,7 +102,7 @@ func NewEngineWithNode(
 }
 
 // NetNode exposes the underlying node.
-func (e *Engine) NetNode() *secure_network.SecureNode { // FIX: Restored to SecureNode
+func (e *Engine) NetNode() *secure_network.MeshNode { // FIX: Updated to MeshNode
 	return e.netNode
 }
 
