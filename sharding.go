@@ -161,9 +161,7 @@ func (r *ConsistentHashRing) GetOwner(
 		idx = 0
 	}
 
-	owner := r.ring[
-		r.sortedHashes[idx]
-	]
+	owner := r.ring[r.sortedHashes[idx]]
 
 	return owner, nil
 }
@@ -304,9 +302,7 @@ func (e *Engine) FindResponsiblePeers(
 			continue
 		}
 
-		peer, ok := e.sharding.peers[
-			shard.Owner
-		]
+		peer, ok := e.sharding.peers[shard.Owner]
 
 		if !ok {
 			continue
