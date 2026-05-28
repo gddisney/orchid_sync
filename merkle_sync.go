@@ -300,7 +300,9 @@ func buildParentNode(
 	if right != nil {
 		combined = append(left.Hash[:], right.Hash[:]...)
 	} else {
-		combined = append(left.Hash[:], ZeroHash()[:]...)
+		// FIX: Assign array to variable before slicing
+		zero := ZeroHash()
+		combined = append(left.Hash[:], zero[:]...)
 	}
 
 	hash := sha256.Sum256(combined)
@@ -412,7 +414,9 @@ func ValidateTree(root *MerkleNode) bool {
 	if root.Right != nil {
 		combined = append(root.Left.Hash[:], root.Right.Hash[:]...)
 	} else {
-		combined = append(root.Left.Hash[:], ZeroHash()[:]...)
+		// FIX: Assign array to variable before slicing
+		zero := ZeroHash()
+		combined = append(root.Left.Hash[:], zero[:]...)
 	}
 
 	expected := sha256.Sum256(combined)
