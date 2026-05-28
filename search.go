@@ -1,340 +1,433 @@
 package orchid_sync
 
 import (
-	"container/heap"
+	"crypto/sha256"
 	"encoding/binary"
-	"errors"
-	"math"
+	"fmt"
 	"sort"
-
-	"github.com/gddisney/ultimate_db"
+	"strings"
+	"sync"
 )
 
 const (
-	IndexPageID ultimate_db.PageID = 10
-	MetaPageID  ultimate_db.PageID = 11
+	DefaultVirtualNodes = 64
+	MaxShardReplicas    = 3
 )
 
-type SearchResult struct {
-	DocID string  `json:"doc_id"`
-	Score float64 `json:"score"`
+// RoutingEntry represents a peer that owns shards.
+type RoutingEntry struct {
+	ID       string
+	Address  string
+	ShardIDs []uint64
+	Healthy  bool
+	Load     int64
 }
 
-type Posting struct {
-	DocID string
-	TF    float64
+// Shard represents a logical index partition.
+type Shard struct {
+	ID       uint64
+	Owner    string
+	Replicas []string
+
+	DocCount uint64
 }
 
-type DocMeta struct {
-	Length uint32 `json:"length"`
+// ConsistentHashRing distributes shards across peers.
+type ConsistentHashRing struct {
+	mu sync.RWMutex
+
+	virtualNodes int
+
+	ring         map[uint64]string
+	sortedHashes []uint64
+
+	peers  map[string]RoutingEntry
+	shards map[uint64]*Shard
 }
 
-type scoredDoc struct {
-	docID string
-	score float64
+// NewConsistentHashRing initializes ring.
+func NewConsistentHashRing(
+	virtualNodes int,
+) *ConsistentHashRing {
+
+	if virtualNodes <= 0 {
+		virtualNodes = DefaultVirtualNodes
+	}
+
+	return &ConsistentHashRing{
+		virtualNodes: virtualNodes,
+		ring:         make(map[uint64]string),
+		peers:        make(map[string]RoutingEntry),
+		shards:       make(map[uint64]*Shard),
+	}
 }
 
-type resultHeap []scoredDoc
+// AddPeer inserts peer into ring.
+func (r *ConsistentHashRing) AddPeer(
+	peer RoutingEntry,
+) {
 
-func (h resultHeap) Len() int { return len(h) }
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-func (h resultHeap) Less(i, j int) bool {
-	return h[i].score < h[j].score
+	r.peers[peer.ID] = peer
+
+	for i := 0; i < r.virtualNodes; i++ {
+
+		key := fmt.Sprintf(
+			"%s#%d",
+			peer.ID,
+			i,
+		)
+
+		hash := hashUint64(key)
+
+		r.ring[hash] = peer.ID
+		r.sortedHashes = append(
+			r.sortedHashes,
+			hash,
+		)
+	}
+
+	sort.Slice(
+		r.sortedHashes,
+		func(i, j int) bool {
+			return r.sortedHashes[i] <
+				r.sortedHashes[j]
+		},
+	)
 }
 
-func (h resultHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-}
+// RemovePeer removes peer from ring.
+func (r *ConsistentHashRing) RemovePeer(
+	peerID string,
+) {
 
-func (h *resultHeap) Push(x interface{}) {
-	*h = append(*h, x.(scoredDoc))
-}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-func (h *resultHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	*h = old[:n-1]
-	return item
-}
+	delete(r.peers, peerID)
 
-func extractTerms(q ultimate_db.Query) []string {
-	switch v := q.(type) {
+	newHashes := make([]uint64, 0)
 
-	case *ultimate_db.TermQuery:
-		if v.Term == "" {
-			return nil
+	for hash, owner := range r.ring {
+
+		if owner == peerID {
+			delete(r.ring, hash)
+			continue
 		}
-		return []string{v.Term}
 
-	case *ultimate_db.AndQuery:
-		left := extractTerms(v.Left)
-		right := extractTerms(v.Right)
-		return append(left, right...)
+		newHashes = append(
+			newHashes,
+			hash,
+		)
+	}
 
-	case *ultimate_db.OrQuery:
-		left := extractTerms(v.Left)
-		right := extractTerms(v.Right)
-		return append(left, right...)
+	r.sortedHashes = newHashes
 
-	case *ultimate_db.NotQuery:
-		return extractTerms(v.Left)
+	sort.Slice(
+		r.sortedHashes,
+		func(i, j int) bool {
+			return r.sortedHashes[i] <
+				r.sortedHashes[j]
+		},
+	)
+}
+
+// GetOwner returns shard owner.
+func (r *ConsistentHashRing) GetOwner(
+	key string,
+) (string, error) {
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if len(r.sortedHashes) == 0 {
+		return "", fmt.Errorf(
+			"empty hash ring",
+		)
+	}
+
+	hash := hashUint64(key)
+
+	idx := sort.Search(
+		len(r.sortedHashes),
+		func(i int) bool {
+			return r.sortedHashes[i] >= hash
+		},
+	)
+
+	if idx >= len(r.sortedHashes) {
+		idx = 0
+	}
+
+	owner := r.ring[
+		r.sortedHashes[idx]
+	]
+
+	return owner, nil
+}
+
+// AssignShard allocates shard ownership.
+func (r *ConsistentHashRing) AssignShard(
+	shardID uint64,
+) (*Shard, error) {
+
+	owner, err := r.GetOwner(
+		fmt.Sprintf(
+			"shard:%d",
+			shardID,
+		),
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	replicas := r.selectReplicas(
+		owner,
+		MaxShardReplicas,
+	)
+
+	shard := &Shard{
+		ID:       shardID,
+		Owner:    owner,
+		Replicas: replicas,
+	}
+
+	r.mu.Lock()
+	r.shards[shardID] = shard
+	r.mu.Unlock()
+
+	return shard, nil
+}
+
+// GetShard returns shard metadata.
+func (r *ConsistentHashRing) GetShard(
+	shardID uint64,
+) (*Shard, bool) {
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	shard, ok := r.shards[shardID]
+
+	return shard, ok
+}
+
+// selectReplicas chooses backup nodes.
+func (r *ConsistentHashRing) selectReplicas(
+	primary string,
+	count int,
+) []string {
+
+	replicas := make([]string, 0)
+
+	for peerID := range r.peers {
+
+		if peerID == primary {
+			continue
+		}
+
+		replicas = append(
+			replicas,
+			peerID,
+		)
+
+		if len(replicas) >= count {
+			break
+		}
+	}
+
+	return replicas
+}
+
+// DetermineRelevantShards maps query terms to shards.
+func (e *Engine) DetermineRelevantShards(
+	query string,
+) []uint64 {
+
+	if e.sharding == nil {
+		return []uint64{0}
+	}
+
+	terms := tokenize(query)
+
+	if len(terms) == 0 {
+		return []uint64{0}
+	}
+
+	shardSet := make(map[uint64]struct{})
+
+	for _, term := range terms {
+
+		shardID := e.computeShardID(term)
+
+		shardSet[shardID] = struct{}{}
+	}
+
+	results := make([]uint64, 0, len(shardSet))
+
+	for id := range shardSet {
+		results = append(results, id)
+	}
+
+	sort.Slice(
+		results,
+		func(i, j int) bool {
+			return results[i] < results[j]
+		},
+	)
+
+	return results
+}
+
+// FindResponsiblePeers resolves owners.
+func (e *Engine) FindResponsiblePeers(
+	shards []uint64,
+	maxPeers int,
+) []RoutingEntry {
+
+	if e.sharding == nil {
+		return nil
+	}
+
+	peerMap := make(map[string]RoutingEntry)
+
+	for _, shardID := range shards {
+
+		shard, ok := e.sharding.GetShard(
+			shardID,
+		)
+
+		if !ok {
+			continue
+		}
+
+		peer, ok := e.sharding.peers[
+			shard.Owner
+		]
+
+		if !ok {
+			continue
+		}
+
+		if !peer.Healthy {
+			continue
+		}
+
+		peerMap[peer.ID] = peer
+	}
+
+	peers := make([]RoutingEntry, 0)
+
+	for _, peer := range peerMap {
+		peers = append(peers, peer)
+	}
+
+	sort.Slice(
+		peers,
+		func(i, j int) bool {
+			return peers[i].Load <
+				peers[j].Load
+		},
+	)
+
+	if maxPeers > 0 &&
+		len(peers) > maxPeers {
+
+		peers = peers[:maxPeers]
+	}
+
+	return peers
+}
+
+// computeShardID hashes terms to shards.
+func (e *Engine) computeShardID(
+	term string,
+) uint64 {
+
+	hash := sha256.Sum256(
+		[]byte(strings.ToLower(term)),
+	)
+
+	return binary.BigEndian.Uint64(
+		hash[:8],
+	)
+}
+
+// RegisterPeer inserts peer.
+func (e *Engine) RegisterPeer(
+	peer RoutingEntry,
+) {
+
+	if e.sharding == nil {
+		e.sharding = NewConsistentHashRing(
+			DefaultVirtualNodes,
+		)
+	}
+
+	e.sharding.AddPeer(peer)
+}
+
+// BootstrapShards creates shard ownership.
+func (e *Engine) BootstrapShards(
+	totalShards uint64,
+) error {
+
+	if e.sharding == nil {
+		return fmt.Errorf(
+			"sharding not initialized",
+		)
+	}
+
+	for i := uint64(0); i < totalShards; i++ {
+
+		_, err := e.sharding.AssignShard(i)
+
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func uniqueTerms(terms []string) []string {
-	seen := make(map[string]struct{})
-	var result []string
+// tokenize normalizes query terms.
+func tokenize(
+	query string,
+) []string {
 
-	for _, t := range terms {
-		if _, ok := seen[t]; ok {
+	query = strings.ToLower(query)
+
+	fields := strings.Fields(query)
+
+	results := make([]string, 0)
+
+	for _, f := range fields {
+
+		f = strings.TrimSpace(f)
+
+		if len(f) == 0 {
 			continue
 		}
 
-		seen[t] = struct{}{}
-		result = append(result, t)
+		results = append(results, f)
 	}
-
-	return result
-}
-
-func decodePosting(data []byte) (Posting, error) {
-	if len(data) < 10 {
-		return Posting{}, errors.New("invalid posting")
-	}
-
-	docLen := binary.BigEndian.Uint16(data[:2])
-
-	if len(data) < int(2+docLen+8) {
-		return Posting{}, errors.New("corrupt posting")
-	}
-
-	docID := string(data[2 : 2+docLen])
-
-	tfBits := binary.BigEndian.Uint64(data[2+docLen:])
-	tf := math.Float64frombits(tfBits)
-
-	return Posting{
-		DocID: docID,
-		TF:    tf,
-	}, nil
-}
-
-func encodePosting(p Posting) []byte {
-	docBytes := []byte(p.DocID)
-
-	buf := make([]byte, 2+len(docBytes)+8)
-
-	binary.BigEndian.PutUint16(buf[:2], uint16(len(docBytes)))
-
-	copy(buf[2:], docBytes)
-
-	binary.BigEndian.PutUint64(
-		buf[2+len(docBytes):],
-		math.Float64bits(p.TF),
-	)
-
-	return buf
-}
-
-func (e *Engine) getDocLength(txn uint64, docID string) float64 {
-	key := []byte("docmeta:" + docID)
-
-	val, err := e.db.Read(MetaPageID, txn, key)
-	if err != nil || len(val) < 4 {
-		return 1
-	}
-
-	length := binary.BigEndian.Uint32(val)
-
-	if length == 0 {
-		return 1
-	}
-
-	return float64(length)
-}
-
-func (e *Engine) collectCandidateDocs(
-	terms []string,
-	txn uint64,
-) map[string]bool {
-
-	candidates := make(map[string]bool)
-
-	for _, term := range terms {
-
-		prefix := []byte("term:" + term + ":")
-
-		_ = e.db.ScanCompressed(
-			IndexPageID,
-			txn,
-			prefix,
-			func(key, value []byte) bool {
-
-				posting, err := decodePosting(value)
-				if err != nil {
-					return true
-				}
-
-				candidates[posting.DocID] = true
-				return true
-			},
-		)
-	}
-
-	return candidates
-}
-
-func (e *Engine) scoreDocuments(
-	terms []string,
-	candidates map[string]bool,
-	txn uint64,
-	limit int,
-) []SearchResult {
-
-	e.mu.RLock()
-	totalDocs := e.TotalDocs
-	avgDocLen := e.AvgDocLen
-	e.mu.RUnlock()
-
-	if totalDocs <= 0 {
-		totalDocs = 1
-	}
-
-	if avgDocLen <= 0 {
-		avgDocLen = 1
-	}
-
-	docScores := make(map[string]float64)
-
-	for _, term := range terms {
-
-		prefix := []byte("term:" + term + ":")
-
-		var postings []Posting
-
-		_ = e.db.ScanCompressed(
-			IndexPageID,
-			txn,
-			prefix,
-			func(key, value []byte) bool {
-
-				posting, err := decodePosting(value)
-				if err != nil {
-					return true
-				}
-
-				postings = append(postings, posting)
-				return true
-			},
-		)
-
-		docFreq := len(postings)
-
-		if docFreq == 0 {
-			continue
-		}
-
-		for _, posting := range postings {
-
-			if !candidates[posting.DocID] {
-				continue
-			}
-
-			docLen := e.getDocLength(txn, posting.DocID)
-
-			score := e.scorer.Score(
-				posting.TF,
-				docLen,
-				avgDocLen,
-				totalDocs,
-				docFreq,
-			)
-
-			docScores[posting.DocID] += score
-		}
-	}
-
-	h := &resultHeap{}
-	heap.Init(h)
-
-	for docID, score := range docScores {
-
-		if h.Len() < limit {
-			heap.Push(h, scoredDoc{
-				docID: docID,
-				score: score,
-			})
-			continue
-		}
-
-		if (*h)[0].score < score {
-
-			heap.Pop(h)
-
-			heap.Push(h, scoredDoc{
-				docID: docID,
-				score: score,
-			})
-		}
-	}
-
-	var results []SearchResult
-
-	for h.Len() > 0 {
-
-		item := heap.Pop(h).(scoredDoc)
-
-		results = append(results, SearchResult{
-			DocID: item.docID,
-			Score: item.score,
-		})
-	}
-
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
-	})
 
 	return results
 }
 
-func (e *Engine) Search(
-	query string,
-	limit int,
-) ([]SearchResult, error) {
+// hashUint64 creates deterministic ring hashes.
+func hashUint64(
+	s string,
+) uint64 {
 
-	if limit <= 0 {
-		limit = 10
-	}
-
-	ast, err := ultimate_db.ParseQuery(query)
-	if err != nil {
-		return nil, err
-	}
-
-	terms := uniqueTerms(extractTerms(ast))
-
-	if len(terms) == 0 {
-		return nil, nil
-	}
-
-	txn := e.db.BeginTxn()
-	defer e.db.CommitTxn(txn)
-
-	candidates := e.collectCandidateDocs(terms, txn)
-
-	if len(candidates) == 0 {
-		return nil, nil
-	}
-
-	results := e.scoreDocuments(
-		terms,
-		candidates,
-		txn,
-		limit,
+	sum := sha256.Sum256(
+		[]byte(s),
 	)
 
-	return results, nil
+	return binary.BigEndian.Uint64(
+		sum[:8],
+	)
 }
