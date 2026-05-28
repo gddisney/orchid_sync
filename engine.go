@@ -73,22 +73,23 @@ func NewEngine(
 }
 
 // NewEngineWithNode creates a secure mesh node internally.
+// NewEngineWithNode creates a secure mesh node internally.
 func NewEngineWithNode(
-	ctx context.Context,
 	db *ultimate_db.DB,
-	gatewayAddr string,
-	signerKey []byte,
-	provider *webauthnext.Provider,
 	sysLog *logger.LogDispatcher,
+	arg1 string, // Likely Gateway Address
+	arg2 string, // Likely Node ID or Host
+	arg3 string, // Likely Port or Protocol
+	signerKey []byte,
 ) (*Engine, error) {
 
-	// FIX: Restored to NewSecureNode to match your remote module
 	node, err := secure_network.NewSecureNode(
-		ctx,
-		gatewayAddr,
-		signerKey,
-		provider,
+		db,
 		sysLog,
+		arg1,
+		arg2,
+		arg3,
+		signerKey,
 	)
 
 	if err != nil {
