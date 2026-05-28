@@ -18,9 +18,7 @@ type ConsistentHashRing struct {
 }
 
 func NewConsistentHashRing(virtualNodes int) *ConsistentHashRing {
-	if virtualNodes <= 0 {
-		virtualNodes = DefaultVirtualNodes
-	}
+	if virtualNodes <= 0 { virtualNodes = DefaultVirtualNodes }
 	return &ConsistentHashRing{
 		virtualNodes: virtualNodes,
 		ring:         make(map[uint64]string),
@@ -45,31 +43,11 @@ func (r *ConsistentHashRing) AddPeer(peer RoutingEntry) {
 func (r *ConsistentHashRing) GetOwner(key string) (string, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if len(r.sortedHashes) == 0 {
-		return "", fmt.Errorf("empty hash ring")
-	}
+	if len(r.sortedHashes) == 0 { return "", fmt.Errorf("empty hash ring") }
 	hash := hashUint64(key)
 	idx := sort.Search(len(r.sortedHashes), func(i int) bool { return r.sortedHashes[i] >= hash })
-	if idx >= len(r.sortedHashes) {
-		idx = 0
-	}
+	if idx >= len(r.sortedHashes) { idx = 0 }
 	return r.ring[r.sortedHashes[idx]], nil
-}
-
-func (r *ConsistentHashRing) AssignShard(shardID uint64) (*Shard, error) {
-	owner, err := r.GetOwner(fmt.Sprintf("shard:%d", shardID))
-	if err != nil {
-		return nil, err
-	}
-	shard := &Shard{
-		ID:       shardID,
-		Owner:    owner,
-		Replicas: r.selectReplicas(owner, MaxShardReplicas),
-	}
-	r.mu.Lock()
-	r.shards[shardID] = shard
-	r.mu.Unlock()
-	return shard, nil
 }
 
 func (r *ConsistentHashRing) GetShard(shardID uint64) (*Shard, bool) {
@@ -77,20 +55,6 @@ func (r *ConsistentHashRing) GetShard(shardID uint64) (*Shard, bool) {
 	defer r.mu.RUnlock()
 	shard, ok := r.shards[shardID]
 	return shard, ok
-}
-
-func (r *ConsistentHashRing) selectReplicas(primary string, count int) []string {
-	replicas := make([]string, 0)
-	for peerID := range r.peers {
-		if peerID == primary {
-			continue
-		}
-		replicas = append(replicas, peerID)
-		if len(replicas) >= count {
-			break
-		}
-	}
-	return replicas
 }
 
 func hashUint64(s string) uint64 {
