@@ -1,633 +1,433 @@
 package orchid_sync
 
 import (
-	"context"
+	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"hash/fnv"
 	"sort"
+	"strings"
 	"sync"
-	"time"
-
-	"github.com/gddisney/secure_network"
 )
 
 const (
-	DefaultSearchTimeout = 5 * time.Second
-	MaxFanoutPeers       = 8
-	DefaultShardCount    = 64
+	DefaultVirtualNodes = 64
+	MaxShardReplicas    = 3
 )
 
-type ClusterQuery struct {
-	QueryID     string    `json:"query_id"`
-	QueryText   string    `json:"query_text"`
-	Limit       int       `json:"limit"`
-	OriginNode  string    `json:"origin_node"`
-	ShardIDs    []uint64  `json:"shard_ids"`
-	RequestedAt time.Time `json:"requested_at"`
+// RoutingEntry represents a peer that owns shards.
+type RoutingEntry struct {
+	ID       string
+	Address  string
+	ShardIDs []uint64
+	Healthy  bool
+	Load     int64
 }
 
-type ClusterResponse struct {
-	QueryID   string         `json:"query_id"`
-	NodeID    string         `json:"node_id"`
-	Results   []SearchResult `json:"results"`
-	Duration  int64          `json:"duration_ms"`
-	Partial   bool           `json:"partial"`
-	ShardID   uint64         `json:"shard_id"`
-	ErrorText string         `json:"error,omitempty"`
+// Shard represents a logical index partition.
+type Shard struct {
+	ID       uint64
+	Owner    string
+	Replicas []string
+
+	DocCount uint64
 }
 
-type PendingQuery struct {
-	QueryID string
+// ConsistentHashRing distributes shards across peers.
+type ConsistentHashRing struct {
+	mu sync.RWMutex
 
-	Expected int
-	Received int
+	virtualNodes int
 
-	ResponseCh chan ClusterResponse
-	Done       chan struct{}
+	ring         map[uint64]string
+	sortedHashes []uint64
 
-	CreatedAt time.Time
+	peers  map[string]RoutingEntry
+	shards map[uint64]*Shard
 }
 
-type SearchCoordinator struct {
-	mu      sync.RWMutex
-	pending map[string]*PendingQuery
-}
+// NewConsistentHashRing initializes ring.
+func NewConsistentHashRing(
+	virtualNodes int,
+) *ConsistentHashRing {
 
-func NewSearchCoordinator() *SearchCoordinator {
-	return &SearchCoordinator{
-		pending: make(map[string]*PendingQuery),
+	if virtualNodes <= 0 {
+		virtualNodes = DefaultVirtualNodes
+	}
+
+	return &ConsistentHashRing{
+		virtualNodes: virtualNodes,
+		ring:         make(map[uint64]string),
+		peers:        make(map[string]RoutingEntry),
+		shards:       make(map[uint64]*Shard),
 	}
 }
 
-func (sc *SearchCoordinator) Register(
-	queryID string,
-	expected int,
-) *PendingQuery {
-
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	pq := &PendingQuery{
-		QueryID:   queryID,
-		Expected:  expected,
-		Received:  0,
-		CreatedAt: time.Now(),
-
-		ResponseCh: make(chan ClusterResponse, expected+4),
-		Done:       make(chan struct{}),
-	}
-
-	sc.pending[queryID] = pq
-
-	return pq
-}
-
-func (sc *SearchCoordinator) Resolve(
-	resp ClusterResponse,
+// AddPeer inserts peer into ring.
+func (r *ConsistentHashRing) AddPeer(
+	peer RoutingEntry,
 ) {
 
-	sc.mu.RLock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	pq, exists := sc.pending[resp.QueryID]
+	r.peers[peer.ID] = peer
 
-	sc.mu.RUnlock()
+	for i := 0; i < r.virtualNodes; i++ {
 
-	if !exists {
-		return
-	}
+		key := fmt.Sprintf(
+			"%s#%d",
+			peer.ID,
+			i,
+		)
 
-	select {
+		hash := hashUint64(key)
 
-	case pq.ResponseCh <- resp:
-
-	default:
-	}
-}
-
-func (sc *SearchCoordinator) Cleanup(
-	queryID string,
-) {
-
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	delete(sc.pending, queryID)
-}
-
-func (sc *SearchCoordinator) ReaperLoop(
-	ctx context.Context,
-	maxAge time.Duration,
-) {
-
-	ticker := time.NewTicker(30 * time.Second)
-
-	defer ticker.Stop()
-
-	for {
-
-		select {
-
-		case <-ctx.Done():
-			return
-
-		case <-ticker.C:
-
-			sc.reapExpired(maxAge)
-		}
-	}
-}
-
-func (sc *SearchCoordinator) reapExpired(
-	maxAge time.Duration,
-) {
-
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	now := time.Now()
-
-	for id, pq := range sc.pending {
-
-		if now.Sub(pq.CreatedAt) > maxAge {
-
-			close(pq.Done)
-
-			delete(sc.pending, id)
-		}
-	}
-}
-
-func (e *Engine) ScatterGather(
-	ctx context.Context,
-	query string,
-	limit int,
-) ([]SearchResult, error) {
-
-	if limit <= 0 {
-		limit = 10
-	}
-
-	queryID := generateQueryID()
-
-	localResults, err := e.Search(
-		query,
-		limit,
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	shards := e.DetermineRelevantShards(
-		query,
-	)
-
-	targetPeers := e.FindResponsiblePeers(
-		shards,
-		MaxFanoutPeers,
-	)
-
-	merged := NewTopKHeap(limit)
-
-	for _, r := range localResults {
-		merged.Push(r)
-	}
-
-	if len(targetPeers) == 0 {
-		return merged.Results(), nil
-	}
-
-	pending := e.coordinator.Register(
-		queryID,
-		len(targetPeers),
-	)
-
-	defer e.coordinator.Cleanup(
-		queryID,
-	)
-
-	clusterQuery := ClusterQuery{
-		QueryID:     queryID,
-		QueryText:   query,
-		Limit:       limit,
-		OriginNode:  e.NodeID(),
-		ShardIDs:    shards,
-		RequestedAt: time.Now().UTC(),
-	}
-
-	payload, err := json.Marshal(
-		clusterQuery,
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	for _, peer := range targetPeers {
-
-		go e.dispatchQuery(
-			ctx,
-			peer,
-			payload,
+		r.ring[hash] = peer.ID
+		r.sortedHashes = append(
+			r.sortedHashes,
+			hash,
 		)
 	}
 
-	timeout := time.NewTimer(
-		DefaultSearchTimeout,
+	sort.Slice(
+		r.sortedHashes,
+		func(i, j int) bool {
+			return r.sortedHashes[i] <
+				r.sortedHashes[j]
+		},
 	)
-
-	defer timeout.Stop()
-
-	for {
-
-		if pending.Received >= pending.Expected {
-			break
-		}
-
-		select {
-
-		case <-ctx.Done():
-			return merged.Results(), ctx.Err()
-
-		case <-pending.Done:
-			return merged.Results(), nil
-
-		case <-timeout.C:
-			return merged.Results(), nil
-
-		case resp := <-pending.ResponseCh:
-
-			pending.Received++
-
-			if resp.ErrorText != "" {
-				continue
-			}
-
-			for _, r := range resp.Results {
-				merged.Push(r)
-			}
-		}
-	}
-
-	return merged.Results(), nil
 }
 
-func (e *Engine) dispatchQuery(
-	ctx context.Context,
-	peer secure_network.RoutingEntry,
-	payload []byte,
+// RemovePeer removes peer from ring.
+func (r *ConsistentHashRing) RemovePeer(
+	peerID string,
 ) {
 
-	if e.netNode == nil {
-		return
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.peers, peerID)
+
+	newHashes := make([]uint64, 0)
+
+	for hash, owner := range r.ring {
+
+		if owner == peerID {
+			delete(r.ring, hash)
+			continue
+		}
+
+		newHashes = append(
+			newHashes,
+			hash,
+		)
 	}
 
-	if e.netNode.PeerMesh == nil {
-		return
-	}
+	r.sortedHashes = newHashes
 
-	_ = e.netNode.PeerMesh.SendToPeer(
-		ctx,
-		peer.ID,
-		payload,
+	sort.Slice(
+		r.sortedHashes,
+		func(i, j int) bool {
+			return r.sortedHashes[i] <
+				r.sortedHashes[j]
+		},
 	)
 }
 
-func (e *Engine) HandleClusterQuery(
-	ctx context.Context,
-	query ClusterQuery,
-) ClusterResponse {
+// GetOwner returns shard owner.
+func (r *ConsistentHashRing) GetOwner(
+	key string,
+) (string, error) {
 
-	start := time.Now()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
-	results, err := e.Search(
-		query.QueryText,
-		query.Limit,
+	if len(r.sortedHashes) == 0 {
+		return "", fmt.Errorf(
+			"empty hash ring",
+		)
+	}
+
+	hash := hashUint64(key)
+
+	idx := sort.Search(
+		len(r.sortedHashes),
+		func(i int) bool {
+			return r.sortedHashes[i] >= hash
+		},
+	)
+
+	if idx >= len(r.sortedHashes) {
+		idx = 0
+	}
+
+	owner := r.ring[
+		r.sortedHashes[idx]
+	]
+
+	return owner, nil
+}
+
+// AssignShard allocates shard ownership.
+func (r *ConsistentHashRing) AssignShard(
+	shardID uint64,
+) (*Shard, error) {
+
+	owner, err := r.GetOwner(
+		fmt.Sprintf(
+			"shard:%d",
+			shardID,
+		),
 	)
 
 	if err != nil {
+		return nil, err
+	}
 
-		return ClusterResponse{
-			QueryID:  query.QueryID,
-			NodeID:   e.NodeID(),
-			Partial:  true,
-			Duration: time.Since(start).Milliseconds(),
-			ErrorText: err.Error(),
+	replicas := r.selectReplicas(
+		owner,
+		MaxShardReplicas,
+	)
+
+	shard := &Shard{
+		ID:       shardID,
+		Owner:    owner,
+		Replicas: replicas,
+	}
+
+	r.mu.Lock()
+	r.shards[shardID] = shard
+	r.mu.Unlock()
+
+	return shard, nil
+}
+
+// GetShard returns shard metadata.
+func (r *ConsistentHashRing) GetShard(
+	shardID uint64,
+) (*Shard, bool) {
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	shard, ok := r.shards[shardID]
+
+	return shard, ok
+}
+
+// selectReplicas chooses backup nodes.
+func (r *ConsistentHashRing) selectReplicas(
+	primary string,
+	count int,
+) []string {
+
+	replicas := make([]string, 0)
+
+	for peerID := range r.peers {
+
+		if peerID == primary {
+			continue
+		}
+
+		replicas = append(
+			replicas,
+			peerID,
+		)
+
+		if len(replicas) >= count {
+			break
 		}
 	}
 
-	return ClusterResponse{
-		QueryID:  query.QueryID,
-		NodeID:   e.NodeID(),
-		Results:  results,
-		Duration: time.Since(start).Milliseconds(),
-	}
+	return replicas
 }
 
-func (e *Engine) HandleClusterResponse(
-	resp ClusterResponse,
-) {
-
-	e.coordinator.Resolve(resp)
-}
-
+// DetermineRelevantShards maps query terms to shards.
 func (e *Engine) DetermineRelevantShards(
 	query string,
 ) []uint64 {
 
+	if e.sharding == nil {
+		return []uint64{0}
+	}
+
 	terms := tokenize(query)
 
-	unique := make(map[uint64]struct{})
+	if len(terms) == 0 {
+		return []uint64{0}
+	}
+
+	shardSet := make(map[uint64]struct{})
 
 	for _, term := range terms {
 
-		shard := e.ComputeShard(term)
+		shardID := e.computeShardID(term)
 
-		unique[shard] = struct{}{}
+		shardSet[shardID] = struct{}{}
 	}
 
-	var shards []uint64
+	results := make([]uint64, 0, len(shardSet))
 
-	for shard := range unique {
-		shards = append(shards, shard)
+	for id := range shardSet {
+		results = append(results, id)
 	}
 
-	sort.Slice(shards, func(i, j int) bool {
-		return shards[i] < shards[j]
-	})
-
-	return shards
-}
-
-func (e *Engine) ComputeShard(
-	term string,
-) uint64 {
-
-	hasher := fnv.New64a()
-
-	_, _ = hasher.Write([]byte(term))
-
-	return hasher.Sum64() %
-		uint64(DefaultShardCount)
-}
-
-func (e *Engine) FindResponsiblePeers(
-	shards []uint64,
-	limit int,
-) []secure_network.RoutingEntry {
-
-	if e.netNode == nil {
-		return nil
-	}
-
-	if e.netNode.PeerMesh == nil {
-		return nil
-	}
-
-	peerMap := make(
-		map[string]secure_network.RoutingEntry,
+	sort.Slice(
+		results,
+		func(i, j int) bool {
+			return results[i] < results[j]
+		},
 	)
 
-	for _, shard := range shards {
+	return results
+}
 
-		var target secure_network.NodeID
+// FindResponsiblePeers resolves owners.
+func (e *Engine) FindResponsiblePeers(
+	shards []uint64,
+	maxPeers int,
+) []RoutingEntry {
 
-		binary.BigEndian.PutUint64(
-			target[:8],
-			shard,
+	if e.sharding == nil {
+		return nil
+	}
+
+	peerMap := make(map[string]RoutingEntry)
+
+	for _, shardID := range shards {
+
+		shard, ok := e.sharding.GetShard(
+			shardID,
 		)
 
-		closest, err := e.netNode.
-			PeerMesh.
-			FindClosestNodes(
-				target,
-				3,
-			)
-
-		if err != nil {
+		if !ok {
 			continue
 		}
 
-		for _, peer := range closest {
+		peer, ok := e.sharding.peers[
+			shard.Owner
+		]
 
-			key := string(peer.ID[:])
-
-			peerMap[key] = peer
+		if !ok {
+			continue
 		}
+
+		if !peer.Healthy {
+			continue
+		}
+
+		peerMap[peer.ID] = peer
 	}
 
-	var peers []secure_network.RoutingEntry
+	peers := make([]RoutingEntry, 0)
 
 	for _, peer := range peerMap {
 		peers = append(peers, peer)
 	}
 
-	sort.Slice(peers, func(i, j int) bool {
-		return peers[i].Address <
-			peers[j].Address
-	})
+	sort.Slice(
+		peers,
+		func(i, j int) bool {
+			return peers[i].Load <
+				peers[j].Load
+		},
+	)
 
-	if limit > 0 &&
-		len(peers) > limit {
+	if maxPeers > 0 &&
+		len(peers) > maxPeers {
 
-		peers = peers[:limit]
+		peers = peers[:maxPeers]
 	}
 
 	return peers
 }
 
-type TopKHeap struct {
-	limit int
-	items []SearchResult
+// computeShardID hashes terms to shards.
+func (e *Engine) computeShardID(
+	term string,
+) uint64 {
+
+	hash := sha256.Sum256(
+		[]byte(strings.ToLower(term)),
+	)
+
+	return binary.BigEndian.Uint64(
+		hash[:8],
+	)
 }
 
-func NewTopKHeap(
-	limit int,
-) *TopKHeap {
-
-	if limit <= 0 {
-		limit = 10
-	}
-
-	return &TopKHeap{
-		limit: limit,
-		items: make([]SearchResult, 0, limit),
-	}
-}
-
-func (h *TopKHeap) Push(
-	item SearchResult,
+// RegisterPeer inserts peer.
+func (e *Engine) RegisterPeer(
+	peer RoutingEntry,
 ) {
 
-	if len(h.items) < h.limit {
-
-		h.items = append(
-			h.items,
-			item,
+	if e.sharding == nil {
+		e.sharding = NewConsistentHashRing(
+			DefaultVirtualNodes,
 		)
-
-		h.up(len(h.items) - 1)
-
-		return
 	}
 
-	if len(h.items) == 0 {
-		return
-	}
-
-	if item.Score <= h.items[0].Score {
-		return
-	}
-
-	h.items[0] = item
-
-	h.down(0)
+	e.sharding.AddPeer(peer)
 }
 
-func (h *TopKHeap) Results() []SearchResult {
+// BootstrapShards creates shard ownership.
+func (e *Engine) BootstrapShards(
+	totalShards uint64,
+) error {
 
-	results := make(
-		[]SearchResult,
-		len(h.items),
-	)
+	if e.sharding == nil {
+		return fmt.Errorf(
+			"sharding not initialized",
+		)
+	}
 
-	copy(results, h.items)
+	for i := uint64(0); i < totalShards; i++ {
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score >
-			results[j].Score
-	})
+		_, err := e.sharding.AssignShard(i)
 
-	return results
-}
-
-func (h *TopKHeap) up(
-	idx int,
-) {
-
-	for {
-
-		parent := (idx - 1) / 2
-
-		if idx == 0 ||
-			h.items[parent].Score <= h.items[idx].Score {
-			break
+		if err != nil {
+			return err
 		}
-
-		h.items[parent],
-			h.items[idx] =
-			h.items[idx],
-			h.items[parent]
-
-		idx = parent
 	}
+
+	return nil
 }
 
-func (h *TopKHeap) down(
-	idx int,
-) {
-
-	for {
-
-		left := idx*2 + 1
-		right := idx*2 + 2
-
-		smallest := idx
-
-		if left < len(h.items) &&
-			h.items[left].Score <
-				h.items[smallest].Score {
-
-			smallest = left
-		}
-
-		if right < len(h.items) &&
-			h.items[right].Score <
-				h.items[smallest].Score {
-
-			smallest = right
-		}
-
-		if smallest == idx {
-			return
-		}
-
-		h.items[idx],
-			h.items[smallest] =
-			h.items[smallest],
-			h.items[idx]
-
-		idx = smallest
-	}
-}
-
-func generateQueryID() string {
-
-	now := time.Now().UTC()
-
-	return fmt.Sprintf(
-		"q_%d",
-		now.UnixNano(),
-	)
-}
-
+// tokenize normalizes query terms.
 func tokenize(
 	query string,
 ) []string {
 
-	var tokens []string
+	query = strings.ToLower(query)
 
-	current := ""
+	fields := strings.Fields(query)
 
-	for _, r := range query {
+	results := make([]string, 0)
 
-		if r == ' ' ||
-			r == '\t' ||
-			r == '\n' {
+	for _, f := range fields {
 
-			if current != "" {
-				tokens = append(
-					tokens,
-					current,
-				)
-			}
+		f = strings.TrimSpace(f)
 
-			current = ""
-
+		if len(f) == 0 {
 			continue
 		}
 
-		current += string(r)
+		results = append(results, f)
 	}
 
-	if current != "" {
-		tokens = append(
-			tokens,
-			current,
-		)
-	}
-
-	return tokens
+	return results
 }
 
-func (e *Engine) ValidateClusterQuery(
-	query ClusterQuery,
-) error {
+// hashUint64 creates deterministic ring hashes.
+func hashUint64(
+	s string,
+) uint64 {
 
-	if query.QueryID == "" {
-		return errors.New("missing query id")
-	}
+	sum := sha256.Sum256(
+		[]byte(s),
+	)
 
-	if query.QueryText == "" {
-		return errors.New("missing query text")
-	}
-
-	if query.Limit <= 0 {
-		return errors.New("invalid limit")
-	}
-
-	return nil
+	return binary.BigEndian.Uint64(
+		sum[:8],
+	)
 }
