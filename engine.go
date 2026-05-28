@@ -1,14 +1,12 @@
 package orchid_sync
 
 import (
-	"context"
 	"encoding/json"
 	"sync"
 
 	"github.com/gddisney/logger"
 	"github.com/gddisney/secure_network"
 	"github.com/gddisney/ultimate_db"
-	"github.com/gddisney/webauthnext"
 )
 
 // MetadataPageID is strictly reserved for global engine state
