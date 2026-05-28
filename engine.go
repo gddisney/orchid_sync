@@ -26,7 +26,7 @@ type EngineState struct {
 // local storage and cluster state.
 type Engine struct {
 	db       *ultimate_db.DB
-	netNode  *secure_network.EdgeNode
+	netNode  *secure_network.SecureNode
 	analyzer *Analyzer
 	scorer   *BM25Scorer
 	logger   *logger.LogDispatcher
@@ -47,7 +47,7 @@ type Engine struct {
 // of the Zero-Trust mesh.
 func NewEngine(
 	db *ultimate_db.DB,
-	node *secure_network.EdgeNode,
+	node *secure_network.SecureNode,
 	sysLog *logger.LogDispatcher,
 ) (*Engine, error) {
 
