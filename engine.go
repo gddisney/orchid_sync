@@ -1,8 +1,6 @@
 package orchid_sync
 
 import (
-	"encoding/json"
-	"fmt"
 	"sort"
 	"strings"
 	"sync"
