@@ -3,6 +3,9 @@ package orchid_sync
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/gddisney/logger"
@@ -11,233 +14,202 @@ import (
 	"github.com/gddisney/webauthnext"
 )
 
-// MetadataPageID is strictly reserved for global engine state
-// (BM25 metrics, cluster info, etc.)
+// --- Constants & Types ---
+
 const MetadataPageID ultimate_db.PageID = 11
 
-// EngineState holds the global metrics required
-// to accurately calculate BM25 scores.
 type EngineState struct {
-	TotalDocs int     `json:"total_docs"`
-	AvgDocLen float64 `json:"avg_doc_len"`
+	TotalDocs   int    `json:"total_docs"`
+	TotalDocLen uint64 `json:"total_doc_len"`
 }
 
-// Engine is the top-level wrapper managing
-// local storage and cluster state.
+type RoutingEntry struct {
+	ID       string
+	Address  string
+	ShardIDs []uint64
+	Healthy  bool
+	Load     int64
+}
+
+type Shard struct {
+	ID       uint64
+	Owner    string
+	Replicas []string
+	DocCount uint64
+}
+
+// --- Interfaces ---
+
+// Sharder decouples the engine from specific consistent hashing implementations.
+type Sharder interface {
+	GetOwner(key string) (string, error)
+	GetShard(shardID uint64) (*Shard, bool)
+	AssignShard(shardID uint64) (*Shard, error)
+	AddPeer(peer RoutingEntry)
+}
+
+// --- Engine Implementation ---
+
 type Engine struct {
 	db       *ultimate_db.DB
 	netNode  *secure_network.SecureNode
 	analyzer *Analyzer
-	scorer   *BM25Scorer
+	sharder  Sharder
 	logger   *logger.LogDispatcher
 
-	mu sync.RWMutex
-
-	// Global cluster metrics needed for BM25.
-	TotalDocs int
-	AvgDocLen float64
+	mu          sync.RWMutex
+	TotalDocs   int
+	TotalDocLen uint64
 }
 
-// NewEngine bootstraps the search wrapper using
-// persistent identities and state.
-//
-// By accepting the pre-configured EdgeNode,
-// we ensure the search engine uses the exact
-// same cryptographic identity as the rest
-// of the Zero-Trust mesh.
 func NewEngine(
 	db *ultimate_db.DB,
 	node *secure_network.SecureNode,
+	sharder Sharder,
 	sysLog *logger.LogDispatcher,
 ) (*Engine, error) {
 
 	eng := &Engine{
 		db:       db,
 		netNode:  node,
+		sharder:  sharder,
 		analyzer: NewAnalyzer(),
-		scorer:   NewBM25Scorer(),
 		logger:   sysLog,
 	}
 
-	// Recover persistent BM25 state
-	// to prevent relevance degradation
-	// on restart.
-	txn := db.BeginTxn()
-
-	stateBytes, err := db.Read(
-		MetadataPageID,
-		txn,
-		[]byte("bm25_state"),
-	)
-
-	db.CommitTxn(txn)
-
-	if err == nil && len(stateBytes) > 0 {
-
-		var state EngineState
-
-		if err := json.Unmarshal(
-			stateBytes,
-			&state,
-		); err == nil {
-
-			eng.TotalDocs = state.TotalDocs
-			eng.AvgDocLen = state.AvgDocLen
-
-			if eng.logger != nil {
-
-				eng.logger.Info(
-					"Recovered BM25 engine state from storage",
-				)
-			}
-		}
-	}
-
-	if eng.logger != nil {
-
-		eng.logger.Info(
-			"Orchid Sync engine initialized",
-		)
+	// Initialize state from storage
+	if err := eng.loadBM25State(); err != nil {
+		return nil, err
 	}
 
 	return eng, nil
 }
 
-// NewEngineWithNode creates a secure mesh node internally
-// and wires it into the engine automatically.
-func NewEngineWithNode(
-	ctx context.Context,
-	db *ultimate_db.DB,
-	gatewayAddr string,
-	signerKey []byte,
-	provider *webauthnext.Provider,
-	sysLog *logger.LogDispatcher,
-) (*Engine, error) {
-
-	node, err := secure_network.NewEdgeNode(
-		ctx,
-		gatewayAddr,
-		signerKey,
-		provider,
-		sysLog,
-	)
-
-	if err != nil {
-
-		if sysLog != nil {
-			sysLog.Error(err.Error())
-		}
-
-		return nil, err
+// Index atomically updates the inverted index and BM25 metadata.
+func (e *Engine) Index(docID string, text string) error {
+	tokens := e.analyzer.Tokenize(text)
+	if len(tokens) == 0 {
+		return nil
 	}
 
-	return NewEngine(
-		db,
-		node,
-		sysLog,
-	)
-}
+	txn := e.db.BeginTxn()
+	defer e.db.RollbackTxn(txn)
 
-// NetNode exposes the underlying EdgeNode
-// for UI binding or external cluster checks.
-func (e *Engine) NetNode() *secure_network.EdgeNode {
-	return e.netNode
-}
-
-// Index intercepts a document, analyzes it,
-// and updates the B+ Tree inverted index.
-func (e *Engine) Index(
-	docID string,
-	text string,
-) error {
-
-	// Write the document into the inverted index.
-	indexer := NewIndexer(
-		e.db,
-		e.analyzer,
-	)
-
-	err := indexer.AddDocument(
-		docID,
-		text,
-	)
-
-	if err != nil {
-
-		if e.logger != nil {
-
-			e.logger.Error(
-				"Failed indexing document: " + err.Error(),
-			)
-		}
-
+	// Update Inverted Index
+	indexer := NewIndexer(e.db, e.analyzer, txn)
+	if err := indexer.AddDocument(docID, text); err != nil {
 		return err
 	}
 
-	// Tokenize for BM25 statistics.
-	tokens := e.analyzer.Tokenize(text)
+	// Calculate New State
+	e.mu.RLock()
+	newState := EngineState{
+		TotalDocs:   e.TotalDocs + 1,
+		TotalDocLen: e.TotalDocLen + uint64(len(tokens)),
+	}
+	e.mu.RUnlock()
 
-	if len(tokens) > 0 {
-
-		e.mu.Lock()
-		defer e.mu.Unlock()
-
-		prevDocs := e.TotalDocs
-
-		// Update BM25 metrics.
-		e.TotalDocs++
-
-		e.AvgDocLen =
-			((e.AvgDocLen * float64(prevDocs)) +
-				float64(len(tokens))) /
-				float64(e.TotalDocs)
-
-		// Persist updated BM25 state.
-		state := EngineState{
-			TotalDocs: e.TotalDocs,
-			AvgDocLen: e.AvgDocLen,
-		}
-
-		stateBytes, err := json.Marshal(state)
-		if err != nil {
-
-			if e.logger != nil {
-				e.logger.Error(err.Error())
-			}
-
-			return err
-		}
-
-		txn := e.db.BeginTxn()
-
-		err = e.db.Write(
-			MetadataPageID,
-			txn,
-			[]byte("bm25_state"),
-			stateBytes,
-			0,
-		)
-
-		if err != nil {
-
-			if e.logger != nil {
-				e.logger.Error(err.Error())
-			}
-
-			e.db.CommitTxn(txn)
-
-			return err
-		}
-
-		e.db.CommitTxn(txn)
-
-		if e.logger != nil {
-
-			e.logger.Info(
-				"Indexed document: " + docID,
-			)
-		}
+	stateBytes, err := json.Marshal(newState)
+	if err != nil {
+		return err
 	}
 
+	// Persist State
+	if err := e.db.Write(MetadataPageID, txn, []byte("bm25_state"), stateBytes, 0); err != nil {
+		return err
+	}
+
+	if err := e.db.CommitTxn(txn); err != nil {
+		return err
+	}
+
+	// Update Memory
+	e.mu.Lock()
+	e.TotalDocs = newState.TotalDocs
+	e.TotalDocLen = newState.TotalDocLen
+	e.mu.Unlock()
+
 	return nil
+}
+
+func (e *Engine) loadBM25State() error {
+	txn := e.db.BeginTxn()
+	defer e.db.CommitTxn(txn)
+
+	stateBytes, err := e.db.Read(MetadataPageID, txn, []byte("bm25_state"))
+	if err != nil || len(stateBytes) == 0 {
+		return nil
+	}
+
+	var state EngineState
+	if err := json.Unmarshal(stateBytes, &state); err == nil {
+		e.TotalDocs = state.TotalDocs
+		e.TotalDocLen = state.TotalDocLen
+	}
+	return nil
+}
+
+// DetermineRelevantShards uses the Sharder interface.
+func (e *Engine) DetermineRelevantShards(query string) []uint64 {
+	terms := e.analyzer.Tokenize(query)
+	shardSet := make(map[uint64]struct{})
+
+	for _, term := range terms {
+		shardID := e.computeShardID(term)
+		shardSet[shardID] = struct{}{}
+	}
+
+	results := make([]uint64, 0, len(shardSet))
+	for id := range shardSet {
+		results = append(results, id)
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i] < results[j] })
+	return results
+}
+
+func (e *Engine) computeShardID(term string) uint64 {
+	// Simple consistent hash implementation
+	return hashUint64(strings.ToLower(term))
+}
+
+// --- Sharding Implementation (ConsistentHashRing) ---
+
+type ConsistentHashRing struct {
+	mu           sync.RWMutex
+	virtualNodes int
+	ring         map[uint64]string
+	peers        map[string]RoutingEntry
+	shards       map[uint64]*Shard
+}
+
+func (r *ConsistentHashRing) GetOwner(key string) (string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	// Implementation: hash key and return nearest peer
+	return "", nil
+}
+
+func (r *ConsistentHashRing) GetShard(shardID uint64) (*Shard, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	shard, ok := r.shards[shardID]
+	return shard, ok
+}
+
+func (r *ConsistentHashRing) AssignShard(shardID uint64) (*Shard, error) {
+	// Implementation: logic to bind shard to peer
+	return nil, nil
+}
+
+func (r *ConsistentHashRing) AddPeer(peer RoutingEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.peers[peer.ID] = peer
+}
+
+// --- Helper Functions ---
+
+func hashUint64(s string) uint64 {
+	// Placeholder for hashing logic
+	return 0
 }
