@@ -3,131 +3,248 @@ package orchid_sync
 import (
 	"encoding/json"
 	"sort"
+	"strings"
 
 	"github.com/gddisney/ultimate_db"
 )
 
-// SearchResult represents a single scored document hit.
+const (
+	IndexPageID = 10
+	MetaPageID  = 11
+)
+
+// SearchResult represents a ranked document hit.
 type SearchResult struct {
-	DocID string  `json:"doc_id"`
-	Score float64 `json:"score"`
+	DocID     string  `json:"doc_id"`
+	Score     float64 `json:"score"`
+	ShardID   string  `json:"shard_id,omitempty"`
+	NodeID    string  `json:"node_id,omitempty"`
+	DocLength int     `json:"doc_length,omitempty"`
 }
 
-// extractTerms walks the ultimate_db AST and retrieves terms to be used for BM25 scoring.
+// extractTerms walks the query AST and extracts searchable terms.
 func extractTerms(q ultimate_db.Query) []string {
 	switch v := q.(type) {
+
 	case *ultimate_db.TermQuery:
-		if v.Term != "" {
-			return []string{v.Term}
+		if v.Term == "" {
+			return nil
 		}
-		return nil
+
+		return []string{
+			strings.ToLower(strings.TrimSpace(v.Term)),
+		}
+
 	case *ultimate_db.AndQuery:
-		return append(extractTerms(v.Left), extractTerms(v.Right)...)
+		return append(
+			extractTerms(v.Left),
+			extractTerms(v.Right)...,
+		)
+
 	case *ultimate_db.OrQuery:
-		return append(extractTerms(v.Left), extractTerms(v.Right)...)
+		return append(
+			extractTerms(v.Left),
+			extractTerms(v.Right)...,
+		)
+
 	case *ultimate_db.NotQuery:
-		// For scoring purposes, we generally only score positive matches.
-		return extractTerms(v.Left)
+		return extractTerms(v.Right)
 	}
+
 	return nil
 }
 
-// getValidDocs evaluates the ultimate_db boolean AST against the B+ Tree inverted index.
-// It bridges ultimate_db's logic parser with orchid_sync's JSON storage format.
-func (e *Engine) getValidDocs(q ultimate_db.Query, txn uint64) map[string]bool {
-	switch v := q.(type) {
-	case *ultimate_db.TermQuery:
-		res := make(map[string]bool)
-		if v.Term == "" {
-			return res
-		}
-		termKey := append([]byte("term:"), []byte(v.Term)...)
-		postingsBytes, err := e.db.Read(10, txn, termKey)
-		if err == nil && len(postingsBytes) > 0 {
-			var postings []Posting
-			if json.Unmarshal(postingsBytes, &postings) == nil {
-				for _, p := range postings {
-					res[p.DocID] = true
-				}
-			}
-		}
-		return res
+// getAllDocs retrieves all indexed document IDs.
+func (e *Engine) getAllDocs(txn uint64) map[string]bool {
+	results := make(map[string]bool)
 
-	case *ultimate_db.AndQuery:
-		left := e.getValidDocs(v.Left, txn)
-		right := e.getValidDocs(v.Right, txn)
-		res := make(map[string]bool)
-		for k := range left {
-			if right[k] {
-				res[k] = true
-			}
-		}
-		return res
+	prefix := []byte("doc:")
 
-	case *ultimate_db.OrQuery:
-		res := e.getValidDocs(v.Left, txn)
-		right := e.getValidDocs(v.Right, txn)
-		for k := range right {
-			res[k] = true
-		}
-		return res
+	_ = e.db.Scan(IndexPageID, txn, prefix,
+		func(key, value []byte) bool {
+			docID := strings.TrimPrefix(string(key), "doc:")
+			results[docID] = true
+			return true
+		},
+	)
 
-	case *ultimate_db.NotQuery:
-		res := e.getValidDocs(v.Left, txn)
-		right := e.getValidDocs(v.Right, txn)
-		for k := range right {
-			delete(res, k)
-		}
-		return res
-	}
-	return make(map[string]bool)
+	return results
 }
 
-// Search processes a free-text/boolean query using ultimate_db's AST parser,
-// filters the document sets, applies BM25 scoring, and returns a ranked list.
-func (e *Engine) Search(query string, limit int) ([]SearchResult, error) {
+// getValidDocs evaluates boolean AST against the inverted index.
+func (e *Engine) getValidDocs(q ultimate_db.Query, txn uint64) map[string]bool {
+
+	switch v := q.(type) {
+
+	case *ultimate_db.TermQuery:
+
+		results := make(map[string]bool)
+
+		term := strings.ToLower(strings.TrimSpace(v.Term))
+		if term == "" {
+			return results
+		}
+
+		termKey := []byte("term:" + term)
+
+		postingsBytes, err := e.db.Read(
+			IndexPageID,
+			txn,
+			termKey,
+		)
+
+		if err != nil || len(postingsBytes) == 0 {
+			return results
+		}
+
+		var postings []Posting
+
+		if err := json.Unmarshal(postingsBytes, &postings); err != nil {
+			return results
+		}
+
+		for _, posting := range postings {
+			results[posting.DocID] = true
+		}
+
+		return results
+
+	case *ultimate_db.AndQuery:
+
+		left := e.getValidDocs(v.Left, txn)
+		right := e.getValidDocs(v.Right, txn)
+
+		results := make(map[string]bool)
+
+		for docID := range left {
+			if right[docID] {
+				results[docID] = true
+			}
+		}
+
+		return results
+
+	case *ultimate_db.OrQuery:
+
+		results := e.getValidDocs(v.Left, txn)
+
+		right := e.getValidDocs(v.Right, txn)
+
+		for docID := range right {
+			results[docID] = true
+		}
+
+		return results
+
+	case *ultimate_db.NotQuery:
+
+		allDocs := e.getAllDocs(txn)
+
+		excluded := e.getValidDocs(v.Right, txn)
+
+		for docID := range excluded {
+			delete(allDocs, docID)
+		}
+
+		return allDocs
+	}
+
+	return map[string]bool{}
+}
+
+// getDocLength fetches stored document token count.
+func (e *Engine) getDocLength(
+	txn uint64,
+	docID string,
+) float64 {
+
+	key := []byte("meta:" + docID)
+
+	val, err := e.db.Read(
+		MetaPageID,
+		txn,
+		key,
+	)
+
+	if err != nil || len(val) == 0 {
+		return e.AvgDocLen
+	}
+
+	var meta struct {
+		Length int `json:"length"`
+	}
+
+	if err := json.Unmarshal(val, &meta); err != nil {
+		return e.AvgDocLen
+	}
+
+	if meta.Length <= 0 {
+		return e.AvgDocLen
+	}
+
+	return float64(meta.Length)
+}
+
+// Search executes distributed BM25 boolean search.
+func (e *Engine) Search(
+	query string,
+	limit int,
+) ([]SearchResult, error) {
+
 	e.mu.RLock()
+
 	totalDocs := e.TotalDocs
 	avgDocLen := e.AvgDocLen
+
 	e.mu.RUnlock()
 
-	// 1. Parse the boolean query using ultimate_db's Query Parser
 	ast, err := ultimate_db.ParseQuery(query)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Open an MVCC transaction for consistent, isolated reads
 	txn := e.db.BeginTxn()
-	defer e.db.CommitTxn(txn) // ultimate_db CommitTxn releases active tracking
+	defer e.db.CommitTxn(txn)
 
-	// 3. Evaluate the boolean AST to find the exact set of matching documents
 	validDocs := e.getValidDocs(ast, txn)
+
 	if len(validDocs) == 0 {
-		return nil, nil // No documents match the boolean criteria
+		return []SearchResult{}, nil
 	}
 
-	// 4. Extract terms from the AST for BM25 Scoring
-	tokens := extractTerms(ast)
-	uniqueTerms := make(map[string]bool)
-	for _, t := range tokens {
-		uniqueTerms[t] = true
+	terms := extractTerms(ast)
+
+	uniqueTerms := make(map[string]struct{})
+
+	for _, term := range terms {
+
+		term = strings.ToLower(
+			strings.TrimSpace(term),
+		)
+
+		if term != "" {
+			uniqueTerms[term] = struct{}{}
+		}
 	}
 
-	// Map to accumulate the final BM25 scores
 	docScores := make(map[string]float64)
 
-	// 5. Calculate Okapi BM25 for each valid document
 	for term := range uniqueTerms {
-		termKey := append([]byte("term:"), []byte(term)...)
-		
-		// Note: IndexPageID = 10 as defined in index.go
-		postingsBytes, err := e.db.Read(10, txn, termKey)
+
+		termKey := []byte("term:" + term)
+
+		postingsBytes, err := e.db.Read(
+			IndexPageID,
+			txn,
+			termKey,
+		)
+
 		if err != nil || len(postingsBytes) == 0 {
 			continue
 		}
 
 		var postings []Posting
+
 		if err := json.Unmarshal(postingsBytes, &postings); err != nil {
 			continue
 		}
@@ -135,39 +252,54 @@ func (e *Engine) Search(query string, limit int) ([]SearchResult, error) {
 		docFreq := len(postings)
 
 		for _, posting := range postings {
-			// Only score documents that successfully passed the boolean AST evaluation
+
 			if !validDocs[posting.DocID] {
 				continue
 			}
 
-			docLen := avgDocLen
-			if docLen <= 0 {
-				docLen = 1
-			}
-			if totalDocs <= 0 {
-				totalDocs = 1
-			}
+			docLen := e.getDocLength(
+				txn,
+				posting.DocID,
+			)
 
-			score := e.scorer.Score(posting.TF, docLen, avgDocLen, totalDocs, docFreq)
+			score := e.scorer.Score(
+				posting.TF,
+				docLen,
+				avgDocLen,
+				totalDocs,
+				docFreq,
+			)
+
 			docScores[posting.DocID] += score
 		}
 	}
 
-	// 6. Convert the score map into a sortable slice
-	var results []SearchResult
+	results := make([]SearchResult, 0, len(docScores))
+
 	for docID, score := range docScores {
+
 		results = append(results, SearchResult{
-			DocID: docID,
-			Score: score,
+			DocID:     docID,
+			Score:     score,
+			DocLength: int(
+				e.getDocLength(txn, docID),
+			),
 		})
 	}
 
-	// 7. Sort descending by score
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
-	})
+	// Stable deterministic ordering
+	sort.SliceStable(results,
+		func(i, j int) bool {
 
-	// 8. Apply the limit
+			if results[i].Score == results[j].Score {
+				return results[i].DocID < results[j].DocID
+			}
+
+			return results[i].Score >
+				results[j].Score
+		},
+	)
+
 	if limit > 0 && len(results) > limit {
 		results = results[:limit]
 	}
