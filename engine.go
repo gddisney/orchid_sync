@@ -78,8 +78,8 @@ func NewEngineWithNode(
 	sysLog *logger.LogDispatcher,
 ) (*Engine, error) {
 
-	// Fixed: Updated to match correct signature (db, signerKey)
-	node, err := secure_network.NewMeshNode(db, signerKey)
+	// Updated to pass all 4 required arguments
+	node, err := secure_network.NewMeshNode(db, signerKey, km, sysLog)
 
 	if err != nil {
 		if sysLog != nil {
